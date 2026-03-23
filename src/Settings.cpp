@@ -8,7 +8,7 @@
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/filewritestream.h"
 #include "rapidjson/writer.h"
-
+#include "SKSEMCP/SKSEMenuFramework.hpp"
 
 namespace ScreenshotMenu {
 
@@ -197,7 +197,7 @@ namespace ScreenshotMenu {
 
         ImGuiMCP::Spacing();
 
-        RenderKeybind("Hide UI", &Settings::toggleUIKey_k, &Settings::toggleUIKey_m, &Settings::toggleUIComboKey_k,
+        RenderKeybind("Screenshot (No UI)", &Settings::toggleUIKey_k, &Settings::toggleUIKey_m, &Settings::toggleUIComboKey_k,
             &Settings::toggleUIKey_g, &Settings::toggleUIComboKey_g);
 
         ImGuiMCP::Separator();
