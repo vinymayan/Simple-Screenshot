@@ -19,7 +19,7 @@ void Prisma::Show() {
         createdView = true;
 
         #ifdef DEV_SERVER
-        constexpr const char* path = "http://localhost:5173";
+        constexpr const char* path = "http://localhost:5175";
         #else
         constexpr const char* path = PRODUCT_NAME "/index.html";
         #endif

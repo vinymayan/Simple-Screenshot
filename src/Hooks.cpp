@@ -17,7 +17,7 @@ struct ProcessInputQueueHook {
 
 bool OnInput(RE::InputEvent* event) { 
     if (!event) return false;
-    if (event->device != RE::INPUT_DEVICE::kKeyboard) return false;
+    //if (event->device != RE::INPUT_DEVICE::kKeyboard) return false;
     auto button = event->AsButtonEvent();
     if (!button) return false;
     if (!button->IsDown()) return false;
@@ -27,6 +27,9 @@ bool OnInput(RE::InputEvent* event) {
         } else {
             Prisma::Hide();
         }
+        return true;
+    }
+    if (!Prisma::IsHidden()) {
         return true;
     }
     return false;

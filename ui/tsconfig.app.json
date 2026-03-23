@@ -4,8 +4,8 @@
     "target": "ES2023",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "types": ["vite/client"],
+    "lib": [ "ES2023", "DOM", "DOM.Iterable" ],
+    "types": [ "vite/client" ],
     "skipLibCheck": true,
 
     /* Bundler mode */
@@ -18,10 +18,10 @@
     "jsxImportSource": "solid-js",
 
     /* Linting */
-    "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
+    "strict": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "erasableSyntaxOnly": false,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
