@@ -1,17 +1,6 @@
 import { defineConfig } from 'vite'
-import { svelte } from '@sveltejs/vite-plugin-svelte'
+import solid from 'vite-plugin-solid'
 
 export default defineConfig({
-    base: '',
-    plugins: [svelte()],
-    build: {
-        assetsDir: '',
-        rollupOptions: {
-            output: {
-                entryFileNames: `[name].js`,
-                chunkFileNames: `[name].js`,
-                assetFileNames: `[name].[ext]`
-            }
-        }
-    }
+  plugins: [solid()],
 })

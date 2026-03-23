@@ -1,18 +1,25 @@
-#include "Plugin.h"
-#include "Hooks.h"
-#include "Prisma.h"
+#include "logger.h"
+#include "Events.h"
+
+
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
-    if (message->type == SKSE::MessagingInterface::kPostLoad) {
-        Prisma::Install();
+    if (message->type == SKSE::MessagingInterface::kDataLoaded) {
+        SetupInputHook();
+        ScreenshotMenu::LoadSettings(); // Carrega config salva
+        ScreenshotMenu::Register();     // Registra o menu
+
+    }
+    if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
+        // Post-load
     }
 }
 
-SKSEPluginLoad(const SKSE::LoadInterface* skse) {
-    SKSE::Init(skse);
-    SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
+SKSEPluginLoad(const SKSE::LoadInterface *skse) {
+
     SetupLog();
     logger::info("Plugin loaded");
-    Hooks::Install();
+    SKSE::Init(skse);
+    SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
     return true;
 }

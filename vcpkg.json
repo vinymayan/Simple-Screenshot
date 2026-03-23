@@ -1,14 +1,24 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "deneme",
+  "name": "simpleshots",
   "version-string": "0.1",
   "dependencies": [
-    "clib-util",
-    "rapidcsv",
-    "directxtk",
+    "fast-cpp-csv-parser",
+    "rsm-binary-io",
     "spdlog",
+    "xbyak",
+    "rapidcsv",
+    "clib-util",
+    "clib-utils-qtr",
+    "directxtk",
+    "skse-mcp",
     "glm",
-    "detours"
+    "detours",
+    "nlohmann-json",
+    "minhook",
+    "miniz",
+    "rapidjson",
+    "stb"
   ],
   "overrides": [
     {
@@ -16,5 +26,5 @@
       "version": "9.1.0"
     }
   ],
-  "builtin-baseline": "78b61582c9e093fda56a01ebb654be15a0033897"
+  "builtin-baseline": "ee12231b20c95013c6638d845d04c91559a1d1ff"
 }
