@@ -1,9 +1,22 @@
-#include "Prisma.h"
+ï»¿#include "Prisma.h"
 #include "PrismaUI_API.h"
 #include "Events.h"
 
-// Acesso à função do Events.cpp para salvar as coordendas fantasmas
+// Acesso Ã  funÃ§Ã£o do Events.cpp para salvar as coordendas fantasmas
 extern void UpdatePendingCrop(int x, int y, int w, int h, const std::vector<std::pair<int, int>>& points);
+extern void PrimeAsyncInputs();
+extern std::atomic<bool> g_isCapturing;
+
+
+std::string EscapeJSString(const std::string& str) {
+    std::string result;
+    for (char c : str) {
+        if (c == '\\') result += "\\\\";
+        else if (c == '"') result += "\\\"";
+        else result += c;
+    }
+    return result;
+}
 
 std::string FormatKeybind(uint32_t k, uint32_t m, uint32_t ck, uint32_t g, uint32_t cg) {
     std::string pc;
@@ -19,28 +32,21 @@ std::string FormatKeybind(uint32_t k, uint32_t m, uint32_t ck, uint32_t g, uint3
     if (!pc.empty()) result += pc;
     if (!pc.empty() && !pad.empty()) result += " / ";
     if (!pad.empty()) result += pad;
-    return result;
+
+    // RETORNA PROTEGIDO PARA O JS
+    return EscapeJSString(result);
 }
 
 PRISMA_UI_API::IVPrismaUI1* PrismaUI = nullptr;
 static PrismaView view;
 static bool g_isGamePaused = false;
 
-void SetGamePause(bool pause) {
-    if (g_isGamePaused == pause) return;
-    g_isGamePaused = pause;
-    auto ui = RE::UI::GetSingleton();
-    if (ui) {
-        if (pause) ui->numPausesGame++;
-        else if (ui->numPausesGame > 0) ui->numPausesGame--;
-    }
-}
 
 void Prisma::Install() {
     PrismaUI = reinterpret_cast<PRISMA_UI_API::IVPrismaUI1*>(PRISMA_UI_API::RequestPluginAPI());
 }
 
-// Helper para evitar código duplicado
+// Helper para evitar cÃ³digo duplicado
 void ParseCropData(const std::string& str, int& comUI, int& x, int& y, int& w, int& h, std::vector<std::pair<int, int>>& points) {
     try {
         size_t pos1 = str.find('|'); size_t pos2 = str.find('|', pos1 + 1);
@@ -73,29 +79,26 @@ void ParseCropData(const std::string& str, int& comUI, int& x, int& y, int& w, i
 }
 
 void Prisma::Show() {
+    if (g_isCapturing) return;
     if (!createdView) {
         createdView = true;
-
-        std::string pathStr;
-#ifdef DEV_SERVER
-        pathStr = "http://localhost:5175";
-#else
-        pathStr = std::string(PRODUCT_NAME) + "/index.html";
-#endif
-
         std::string withUIKeys = FormatKeybind(Settings::captureWithUIKey_k, Settings::captureWithUIKey_m, Settings::captureWithUICombo_k, Settings::captureWithUIKey_g, Settings::captureWithUICombo_g);
         std::string noUIKeys = FormatKeybind(Settings::captureNoUIKey_k, Settings::captureNoUIKey_m, Settings::captureNoUICombo_k, Settings::captureNoUIKey_g, Settings::captureNoUICombo_g);
 
-        
-        pathStr += "#" + std::to_string(Settings::customWidth) + "|" + std::to_string(Settings::customHeight) + "|" + (Settings::useCustomResolution ? "1" : "0") + "|" + withUIKeys + "|" + noUIKeys;
+        std::string pathStr;
+        #ifdef DEV_SERVER
+                pathStr = "http://localhost:5175";
+        #else
+                pathStr = std::string(PRODUCT_NAME) + "/index.html";
+        #endif
+
+        pathStr += "#" + std::to_string(Settings::customWidth) + "|" + std::to_string(Settings::customHeight) + "|" + (Settings::useCustomResolution ? "1" : "0") + "|" + withUIKeys + "|" + noUIKeys + "|" + Settings::defaultRatio + "|" + std::to_string(Settings::defaultCustomRatioW) + "|" + std::to_string(Settings::defaultCustomRatioH);
 
         static std::string staticPath;
-        staticPath = pathStr;
         staticPath = pathStr;
 
         view = PrismaUI->CreateView(staticPath.c_str(), [](PrismaView view) -> void {
             PrismaUI->Focus(view, true);
-            SetGamePause(true);
             });
 
         PrismaUI->RegisterJSListener(view, "takeScreenshot", [](const char* data) -> void {
@@ -105,30 +108,43 @@ void Prisma::Show() {
             TriggerRegionScreenshot(comUI != 0, x, y, w, h, points);
             });
 
-        // NOVO: Ouvinte fantasma para sincronizar o retângulo enquanto arrastamos!
+
         PrismaUI->RegisterJSListener(view, "syncCropData", [](const char* data) -> void {
             int comUI = 0, x = 0, y = 0, w = 0, h = 0;
             std::vector<std::pair<int, int>> points;
             ParseCropData(std::string(data), comUI, x, y, w, h, points);
-            UpdatePendingCrop(x, y, w, h, points); // Atualiza a variável global do C++
+            UpdatePendingCrop(x, y, w, h, points);
+            });
+
+        PrismaUI->RegisterJSListener(view, "requestKeybinds", [](const char* data) -> void {
+            UpdateKeybindsUI();
             });
 
         PrismaUI->RegisterJSListener(view, "hideWindow", [](const char* data) -> void {
             PrismaUI->Hide(view);
-            SetGamePause(false);
             });
         return;
     }
-
     PrismaUI->Show(view);
     PrismaUI->Focus(view, true);
-    SetGamePause(true);
+    
 }
 
 void Prisma::Hide() {
+
     PrismaUI->Unfocus(view);
     PrismaUI->Hide(view);
-    SetGamePause(false);
 }
 
 bool Prisma::IsHidden() { return PrismaUI->IsHidden(view); }
+
+void Prisma::UpdateKeybindsUI() {
+    if (!createdView) return;
+
+    std::string withUIKeys = FormatKeybind(Settings::captureWithUIKey_k, Settings::captureWithUIKey_m, Settings::captureWithUICombo_k, Settings::captureWithUIKey_g, Settings::captureWithUICombo_g);
+    std::string noUIKeys = FormatKeybind(Settings::captureNoUIKey_k, Settings::captureNoUIKey_m, Settings::captureNoUICombo_k, Settings::captureNoUIKey_g, Settings::captureNoUICombo_g);
+
+    std::string jsCommand = "setTimeout(function() { if (window.updateKeybinds) window.updateKeybinds(\"" + withUIKeys + "\", \"" + noUIKeys + "\"); }, 50);";
+
+    PrismaUI->Invoke(view, jsCommand.c_str());
+}

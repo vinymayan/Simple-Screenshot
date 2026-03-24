@@ -1,4 +1,4 @@
-#include "Settings.h"
+﻿#include "Settings.h"
 #include <Windows.h>
 #include <filesystem>
 #include <vector>
@@ -8,7 +8,7 @@
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/filewritestream.h"
 #include "rapidjson/writer.h"
-#include "SKSEMCP/SKSEMenuFramework.hpp"
+#include "Prisma.h"
 
 namespace ScreenshotMenu {
 
@@ -99,7 +99,10 @@ namespace ScreenshotMenu {
             }
         }
         ImGuiMCP::PopID();
-        if (changed) SaveSettings();
+        if (changed) {
+            SaveSettings();
+            Prisma::UpdateKeybindsUI();
+        }
     }
 
     void SaveSettings() {
@@ -128,6 +131,9 @@ namespace ScreenshotMenu {
         doc.AddMember("useCustomResolution", Settings::useCustomResolution, allocator);
         doc.AddMember("customWidth", Settings::customWidth, allocator);
         doc.AddMember("customHeight", Settings::customHeight, allocator);
+        doc.AddMember("defaultRatio", rapidjson::StringRef(Settings::defaultRatio.c_str()), allocator);
+        doc.AddMember("defaultCustomRatioW", Settings::defaultCustomRatioW, allocator);
+        doc.AddMember("defaultCustomRatioH", Settings::defaultCustomRatioH, allocator);
         doc.AddMember("imageFormat", static_cast<int>(Settings::imageFormat), allocator);
         doc.AddMember("screenshotPath", rapidjson::StringRef(Settings::screenshotPath.c_str()), allocator);
 
@@ -174,6 +180,9 @@ namespace ScreenshotMenu {
                 if (doc.HasMember("useCustomResolution")) Settings::useCustomResolution = doc["useCustomResolution"].GetBool();
                 if (doc.HasMember("customWidth")) Settings::customWidth = doc["customWidth"].GetInt();
                 if (doc.HasMember("customHeight")) Settings::customHeight = doc["customHeight"].GetInt();
+                if (doc.HasMember("defaultRatio")) Settings::defaultRatio = doc["defaultRatio"].GetString(); 
+                if (doc.HasMember("defaultCustomRatioW")) Settings::defaultCustomRatioW = doc["defaultCustomRatioW"].GetInt();
+                if (doc.HasMember("defaultCustomRatioH")) Settings::defaultCustomRatioH = doc["defaultCustomRatioH"].GetInt();
                 if (doc.HasMember("imageFormat")) Settings::imageFormat = static_cast<ScreenshotFormat>(doc["imageFormat"].GetInt());
                 if (doc.HasMember("screenshotPath")) Settings::screenshotPath = doc["screenshotPath"].GetString();
             }
@@ -202,6 +211,30 @@ namespace ScreenshotMenu {
         ImGuiMCP::Separator();
         ImGuiMCP::Text("Default Resolution:");
 
+        const char* ratio_options[] = { "Free", "1:1", "3:2", "4:3", "16:9", "Custom" };
+        const char* ratio_values[] = { "custom", "1:1", "3:2", "4:3", "16:9", "custom-input" };
+        int current_ratio_idx = 0;
+        for (int i = 0; i < 6; ++i) { // Agora são 6 opções
+            if (Settings::defaultRatio == ratio_values[i]) { current_ratio_idx = i; break; }
+        }
+        if (ImGuiMCP::Combo("Default Ratio", &current_ratio_idx, ratio_options, 6)) {
+            Settings::defaultRatio = ratio_values[current_ratio_idx];
+            changed = true;
+        }
+
+        // Se o Ratio for Custom, mostra os campos para digitar W e H
+        if (Settings::defaultRatio == "custom-input") {
+            ImGuiMCP::Indent();
+            if (ImGuiMCP::InputInt("Ratio Width", &Settings::defaultCustomRatioW)) {
+                if (Settings::defaultCustomRatioW < 1) Settings::defaultCustomRatioW = 1;
+                changed = true;
+            }
+            if (ImGuiMCP::InputInt("Ratio Height", &Settings::defaultCustomRatioH)) {
+                if (Settings::defaultCustomRatioH < 1) Settings::defaultCustomRatioH = 1;
+                changed = true;
+            }
+            ImGuiMCP::Unindent();
+        }
         if (ImGuiMCP::Checkbox("Use Custom Resolution", &Settings::useCustomResolution)) changed = true;
 
         if (Settings::useCustomResolution) {
@@ -281,7 +314,10 @@ namespace ScreenshotMenu {
             }
             ImGuiMCP::Unindent();
         }
-        if (changed) SaveSettings();
+        if (changed) {
+            SaveSettings();
+            Prisma::UpdateKeybindsUI();
+        }
     }
 
     void Register() {

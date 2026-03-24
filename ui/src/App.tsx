@@ -1,4 +1,4 @@
-import { createSignal, onMount, onCleanup, Show, createEffect } from 'solid-js'; 
+﻿import { createSignal, onMount, onCleanup, Show, createEffect } from 'solid-js'; 
 import './App.css';
 
 function App() {
@@ -18,6 +18,17 @@ function App() {
     const [resizeDir, setResizeDir] = createSignal('');
     const [withUIKeyText, setWithUIKeyText] = createSignal("");
     const [noUIKeyText, setNoUIKeyText] = createSignal("");
+
+    // @ts-ignore
+    window.updateKeybinds = (withUI: string, noUI: string) => {
+        setWithUIKeyText(withUI);
+        setNoUIKeyText(noUI);
+    };
+
+    const fetchKeybinds = () => {
+        // @ts-ignore
+        if (window.requestKeybinds) window.requestKeybinds("");
+    };
 
     createEffect(() => {
         let cx = 0, cy = 0, cw = 0, ch = 0;
@@ -62,6 +73,7 @@ function App() {
             setRect({ x: e.clientX, y: e.clientY, w: 0, h: 0 });
         }
     };
+
     const handleMouseMove = (e: MouseEvent) => { 
         if (action() === 'drawing') {
             if (toolMode() === 'lasso') {
@@ -109,32 +121,69 @@ function App() {
     onMount(() => {
         window.addEventListener('mouseup', handleMouseUp);
 
-        const hash = decodeURIComponent(window.location.hash.replace('#', ''));
-        if (hash) {
-            const parts = hash.split('|'); 
-            if (parts.length >= 3) {
-                const w = Number(parts[0]);
-                const h = Number(parts[1]);
-                const useCustom = parts[2];
+        fetchKeybinds();
+        window.addEventListener('focus', fetchKeybinds);
 
-                if (useCustom === '1' && w > 0 && h > 0) {
-                    const sw = window.innerWidth; const sh = window.innerHeight;
-                    setRect({ x: (sw - w) / 2, y: (sh - h) / 2, w: w, h: h });
+        setTimeout(() => {
+            const hash = decodeURIComponent(window.location.hash.replace('#', ''));
+            if (hash) {
+                const parts = hash.split('|');
+                if (parts.length >= 3) {
+                    const w = Number(parts[0]);
+                    const h = Number(parts[1]);
+                    const useCustom = parts[2];
+
+
+                    let r = 0;
+                    if (parts[5]) {
+                        const initialRatio = parts[5];
+                        setSelectedRatio(initialRatio);
+
+                        let rw = 0, rh = 0;
+                        if (initialRatio === 'custom-input') {
+                            rw = Number(parts[6]) || 16;
+                            rh = Number(parts[7]) || 9;
+                            setCustomRatioW(rw);
+                            setCustomRatioH(rh);
+                        } else if (initialRatio !== 'custom') {
+                            const splits = initialRatio.split(':');
+                            rw = Number(splits[0]);
+                            rh = Number(splits[1]);
+                        }
+
+                        if (rw > 0 && rh > 0) {
+                            r = rw / rh;
+                        }
+                    }
+
+                    if (useCustom === '1' && w > 0 && h > 0) {
+                        const sw = window.innerWidth;
+                        const sh = window.innerHeight;
+                        let newW = w;
+                        let newH = h;
+
+                        if (r > 0) {
+                            if (newW / r > newH) newW = newH * r;
+                            else newH = newW / r;
+                        }
+
+                        setRect({ x: (sw - newW) / 2, y: (sh - newH) / 2, w: newW, h: newH });
+                    } else {
+                        selectFullScreen();
+                    }
                 } else {
                     selectFullScreen();
                 }
-
-                if (parts[3]) setWithUIKeyText(parts[3]);
-                if (parts[4]) setNoUIKeyText(parts[4]);
             } else {
                 selectFullScreen();
             }
-        } else {
-            selectFullScreen();
-        }
+        }, 100);
     });
 
-    onCleanup(() => { window.removeEventListener('mouseup', handleMouseUp); });
+    onCleanup(() => {
+        window.removeEventListener('mouseup', handleMouseUp);
+        window.removeEventListener('focus', fetchKeybinds); 
+    });
 
     const fechar = () => {
         // @ts-ignore

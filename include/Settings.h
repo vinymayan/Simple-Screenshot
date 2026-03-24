@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 #include "SKSEMCP/SKSEMenuFramework.hpp"
 #include <string>
 #include <map>
@@ -19,7 +19,7 @@ namespace Settings {
     inline uint32_t openModeCombo_g = 0;
 
     // 2. Capturar Com UI
-    inline uint32_t captureWithUIKey_k = 0;
+    inline uint32_t captureWithUIKey_k = 183;
     inline uint32_t captureWithUIKey_m = 0;
     inline uint32_t captureWithUICombo_k = 0;
     inline uint32_t captureWithUIKey_g = 0;
@@ -32,12 +32,15 @@ namespace Settings {
     inline uint32_t captureNoUIKey_g = 0;
     inline uint32_t captureNoUICombo_g = 0;
 
-    // Configurações e Resolução
+    // ConfiguraÃ§Ãµes e ResoluÃ§Ã£o
     inline std::string screenshotPath = "Screenshots";
     inline ScreenshotFormat imageFormat = ScreenshotFormat::PNG;
     inline bool useCustomResolution = false;
     inline int customWidth = 1920;
     inline int customHeight = 1080;
+    inline std::string defaultRatio = "custom";
+    inline int defaultCustomRatioW = 16; 
+    inline int defaultCustomRatioH = 9;  
 }
 
 namespace ScreenshotMenu {
@@ -59,7 +62,7 @@ const std::map<int, const char*> g_gamepad_to_name_map = {
 };
 
 
-// MAPA 2: Converte o Scan Code do DirectX para um Nome (o que você precisa exibir) - O seu mapa original.
+// MAPA 2: Converte o Scan Code do DirectX para um Nome (o que vocÃª precisa exibir) - O seu mapa original.
 const std::map<int, const char*> g_dx_to_name_map = {
     {0, "[Nenhuma]"},
     {1, "Escape"},

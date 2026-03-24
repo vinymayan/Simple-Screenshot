@@ -1,4 +1,4 @@
-#include "Events.h"
+﻿#include "Events.h"
 #include "logger.h"
 #include <Windows.h>
 #include <d3d11.h>
@@ -39,6 +39,8 @@ Present_t OriginalPresent = nullptr;
 typedef int64_t(*RenderUI_t)(int64_t);
 RenderUI_t OriginalRenderUI = nullptr;
 
+std::atomic<bool> g_isCapturing = false;
+
 struct CropData {
     bool active = false;
     int x = 0, y = 0, w = 0, h = 0;
@@ -57,6 +59,7 @@ bool IsPointInPolygon(int x, int y, const std::vector<std::pair<int, int>>& poly
 }
 
 void TriggerScreenshotRequest(ScreenshotFormat format, bool withoutUI = false) {
+    g_isCapturing = true;
     g_pendingFormat = format;
     if (withoutUI) g_captureNextFrameWithoutUI = true;
     else g_captureNextFrameWithUI = true;
@@ -174,6 +177,7 @@ std::string GetScreenshotPath(const char* ext) {
 }
 
 void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat format, bool withoutUI) {
+    std::shared_ptr<void> unlocker(nullptr, [](void*) { g_isCapturing = false; });
     if (!swapChain) return;
     Microsoft::WRL::ComPtr<ID3D11Device> device11;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context11;
@@ -290,12 +294,20 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     context11->Unmap(stagingTex.Get(), 0);
 
     std::string path = GetScreenshotPath(format == ScreenshotFormat::PNG ? ".png" : (format == ScreenshotFormat::JPG ? ".jpg" : ".bmp"));
-    int success = 0;
-    if (format == ScreenshotFormat::PNG) success = stbi_write_png(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), targetWidth * 4);
-    else if (format == ScreenshotFormat::JPG) success = stbi_write_jpg(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), 90);
-    else success = stbi_write_bmp(path.c_str(), targetWidth, targetHeight, 4, pixelData.data());
+    std::thread([format, path, targetWidth, targetHeight, pixelData = std::move(pixelData), unlocker]() mutable {
+        int success = 0;
 
-    if (success) { CopyFileToClipboard(path); }
+        if (format == ScreenshotFormat::PNG)
+            success = stbi_write_png(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), targetWidth * 4);
+        else if (format == ScreenshotFormat::JPG)
+            success = stbi_write_jpg(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), 90);
+        else
+            success = stbi_write_bmp(path.c_str(), targetWidth, targetHeight, 4, pixelData.data());
+
+        if (success) {
+            CopyFileToClipboard(path);
+        }
+        }).detach();
 }
 
 int64_t Hooked_RenderUI(int64_t gMenuManager) {
@@ -339,41 +351,52 @@ void InstallHooks() {
         REL::RelocationID(35556, 36555).address() + REL::Relocate(0x3ab, 0x371), (uintptr_t)Hooked_RenderUI));
 }
 
-// Vari�veis para rastrear o estado das teclas e evitar que 1 clique dispare 10 fotos
+// Variáveis para rastrear o estado das teclas e evitar que 1 clique dispare 10 fotos
 static bool g_wasCapUIPressedAsync = false;
 static bool g_wasCapNoUIPressedAsync = false;
+static bool g_wasOpenPressedAsync = false;
+
+void PrimeAsyncInputs() {
+    g_wasCapUIPressedAsync = true;
+    g_wasCapNoUIPressedAsync = true;
+    g_wasOpenPressedAsync = true;
+}
 
 void PollAsyncInputs() {
     // --- 1. TECLADO/MOUSE ASYNC (Ignora o roubo de foco do Windows) ---
     if (!Prisma::IsHidden()) {
-        bool capUI_k = Settings::captureWithUIKey_k != 0 && IsInputDown(Settings::captureWithUIKey_k);
-        bool capUI_m = Settings::captureWithUIKey_m != 0 && IsInputDown(Settings::captureWithUIKey_m);
-        bool capUI_pressed = capUI_k || capUI_m;
+        bool capUI_pressed = (Settings::captureWithUIKey_k != 0 && IsInputDown(Settings::captureWithUIKey_k)) ||
+            (Settings::captureWithUIKey_m != 0 && IsInputDown(Settings::captureWithUIKey_m));
 
+        bool capNoUI_pressed = (Settings::captureNoUIKey_k != 0 && IsInputDown(Settings::captureNoUIKey_k)) ||
+            (Settings::captureNoUIKey_m != 0 && IsInputDown(Settings::captureNoUIKey_m));
+
+        bool open_pressed = (Settings::openModeKey_k != 0 && IsInputDown(Settings::openModeKey_k)) ||
+            (Settings::openModeKey_m != 0 && IsInputDown(Settings::openModeKey_m));
+
+        // HIERARQUIA: 1º Com UI, 2º Sem UI, 3º Apenas Fechar
         if (capUI_pressed && !g_wasCapUIPressedAsync) {
-            bool comboHeld = (Settings::captureWithUICombo_k == 0) || IsInputDown(Settings::captureWithUICombo_k);
-            if (comboHeld) {
-                Prisma::Hide();
-                ApplyPendingCropAndTrigger(true);
+            if (Settings::captureWithUICombo_k == 0 || IsInputDown(Settings::captureWithUICombo_k)) {
+                Prisma::Hide(); ApplyPendingCropAndTrigger(true);
             }
         }
+        else if (capNoUI_pressed && !g_wasCapNoUIPressedAsync) {
+            if (Settings::captureNoUICombo_k == 0 || IsInputDown(Settings::captureNoUICombo_k)) {
+                Prisma::Hide(); ApplyPendingCropAndTrigger(false);
+            }
+        }
+        else if (open_pressed && !g_wasOpenPressedAsync) {
+            if (Settings::openModeCombo_k == 0 || IsInputDown(Settings::openModeCombo_k)) {
+                Prisma::Hide();
+            }
+        }
+
         g_wasCapUIPressedAsync = capUI_pressed;
-
-        bool capNoUI_k = Settings::captureNoUIKey_k != 0 && IsInputDown(Settings::captureNoUIKey_k);
-        bool capNoUI_m = Settings::captureNoUIKey_m != 0 && IsInputDown(Settings::captureNoUIKey_m);
-        bool capNoUI_pressed = capNoUI_k || capNoUI_m;
-
-        if (capNoUI_pressed && !g_wasCapNoUIPressedAsync) {
-            bool comboHeld = (Settings::captureNoUICombo_k == 0) || IsInputDown(Settings::captureNoUICombo_k);
-            if (comboHeld) {
-                Prisma::Hide();
-                ApplyPendingCropAndTrigger(false);
-            }
-        }
         g_wasCapNoUIPressedAsync = capNoUI_pressed;
+        g_wasOpenPressedAsync = open_pressed;
     }
 
-    // --- 2. GAMEPAD (Sua l�gica original mantida aqui dentro) ---
+    // --- 2. GAMEPAD ---
     XINPUT_STATE currentState; ZeroMemory(&currentState, sizeof(XINPUT_STATE));
     if (XInputGetState(0, &currentState) != ERROR_SUCCESS) { g_gamepadConnected = false; return; }
     if (!g_gamepadConnected) { g_gamepadConnected = true; g_lastGamepadState = currentState; return; }
@@ -386,31 +409,30 @@ void PollAsyncInputs() {
     bool triggerOpen = false;
     if (IsPressed(Settings::openModeKey_g)) { if (IsHeld(Settings::openModeCombo_g)) triggerOpen = true; }
     else if (IsPressed(Settings::openModeCombo_g)) { if (IsHeld(Settings::openModeKey_g)) triggerOpen = true; }
-    if (triggerOpen) {
-        if (Prisma::IsHidden()) Prisma::Show();
-        else Prisma::Hide();
-    }
 
     bool triggerCapUI = false;
     if (IsPressed(Settings::captureWithUIKey_g)) { if (IsHeld(Settings::captureWithUICombo_g)) triggerCapUI = true; }
     else if (IsPressed(Settings::captureWithUICombo_g)) { if (IsHeld(Settings::captureWithUIKey_g)) triggerCapUI = true; }
-    if (triggerCapUI && !Prisma::IsHidden()) {
-        Prisma::Hide();
-        ApplyPendingCropAndTrigger(true);
-    }
 
     bool triggerCapNoUI = false;
     if (IsPressed(Settings::captureNoUIKey_g)) { if (IsHeld(Settings::captureNoUICombo_g)) triggerCapNoUI = true; }
     else if (IsPressed(Settings::captureNoUICombo_g)) { if (IsHeld(Settings::captureNoUIKey_g)) triggerCapNoUI = true; }
-    if (triggerCapNoUI && !Prisma::IsHidden()) {
-        Prisma::Hide();
-        ApplyPendingCropAndTrigger(false);
+
+    if (!Prisma::IsHidden()) {
+        if (triggerCapUI) { Prisma::Hide(); ApplyPendingCropAndTrigger(true); }
+        else if (triggerCapNoUI) { Prisma::Hide(); ApplyPendingCropAndTrigger(false); }
+        else if (triggerOpen) { Prisma::Hide(); }
     }
+    else {
+        if (triggerOpen) Prisma::Show();
+    }
+
     g_lastGamepadState = currentState;
 }
 
 LRESULT CALLBACK MySubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     if (msg == WM_TIMER && wParam == 0x5353) PollAsyncInputs();
+
     uint32_t pressedKey = 0; bool isKeyboard = false;
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         pressedKey = MapVirtualKey(static_cast<UINT>(wParam), MAPVK_VK_TO_VSC);
@@ -432,34 +454,29 @@ LRESULT CALLBACK MySubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         bool isOpen_Trigger = (isKeyboard && Settings::openModeKey_k != 0 && pressedKey == Settings::openModeKey_k) ||
             (!isKeyboard && Settings::openModeKey_m != 0 && pressedKey == Settings::openModeKey_m);
-        if (isOpen_Trigger) {
-            bool comboHeld = (Settings::openModeCombo_k == 0) || IsInputDown(Settings::openModeCombo_k);
-            if (comboHeld) {
-                if (Prisma::IsHidden()) Prisma::Show();
-                else Prisma::Hide();
-                blockInput = true;
-            }
-        }
 
         bool isCapUI_Trigger = (isKeyboard && Settings::captureWithUIKey_k != 0 && pressedKey == Settings::captureWithUIKey_k) ||
             (!isKeyboard && Settings::captureWithUIKey_m != 0 && pressedKey == Settings::captureWithUIKey_m);
-        if (isCapUI_Trigger && !Prisma::IsHidden()) {
-            bool comboHeld = (Settings::captureWithUICombo_k == 0) || IsInputDown(Settings::captureWithUICombo_k);
-            if (comboHeld) {
-                Prisma::Hide();
-                ApplyPendingCropAndTrigger(true);
-                blockInput = true;
-            }
-        }
 
         bool isCapNoUI_Trigger = (isKeyboard && Settings::captureNoUIKey_k != 0 && pressedKey == Settings::captureNoUIKey_k) ||
             (!isKeyboard && Settings::captureNoUIKey_m != 0 && pressedKey == Settings::captureNoUIKey_m);
-        if (isCapNoUI_Trigger && !Prisma::IsHidden()) {
-            bool comboHeld = (Settings::captureNoUICombo_k == 0) || IsInputDown(Settings::captureNoUICombo_k);
-            if (comboHeld) {
-                Prisma::Hide();
-                ApplyPendingCropAndTrigger(false);
-                blockInput = true;
+
+        if (!Prisma::IsHidden()) {
+            // HIERARQUIA: Captura sobrepõe o botão de Fechar (se forem iguais)
+            if (isCapUI_Trigger && ((Settings::captureWithUICombo_k == 0) || IsInputDown(Settings::captureWithUICombo_k))) {
+                Prisma::Hide(); ApplyPendingCropAndTrigger(true); blockInput = true;
+            }
+            else if (isCapNoUI_Trigger && ((Settings::captureNoUICombo_k == 0) || IsInputDown(Settings::captureNoUICombo_k))) {
+                Prisma::Hide(); ApplyPendingCropAndTrigger(false); blockInput = true;
+            }
+            else if (isOpen_Trigger && ((Settings::openModeCombo_k == 0) || IsInputDown(Settings::openModeCombo_k))) {
+                Prisma::Hide(); blockInput = true;
+            }
+        }
+        else {
+            // Se o menu está fechado, o botão de abrir funciona normalmente
+            if (isOpen_Trigger && ((Settings::openModeCombo_k == 0) || IsInputDown(Settings::openModeCombo_k))) {
+                Prisma::Show(); blockInput = true;
             }
         }
         if (blockInput) return 0;

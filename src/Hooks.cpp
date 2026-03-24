@@ -1,4 +1,4 @@
-#include "Hooks.h"
+﻿#include "Hooks.h"
 #include "InputEventHandler.h"
 #include "Prisma.h"
 
@@ -17,7 +17,7 @@ struct ProcessInputQueueHook {
 
 bool OnInput(RE::InputEvent* event) { 
     if (!event) return false;
-    //if (event->device != RE::INPUT_DEVICE::kKeyboard) return false;
+    if (event->device != RE::INPUT_DEVICE::kKeyboard) return false;
     auto button = event->AsButtonEvent();
     if (!button) return false;
     if (!button->IsDown()) return false;

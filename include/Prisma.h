@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 class Prisma {
     static inline bool createdView = false;
@@ -7,4 +7,5 @@ public:
     static void Show();
     static void Hide();
     static bool IsHidden();
+    static void UpdateKeybindsUI();
 };
