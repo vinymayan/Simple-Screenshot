@@ -157,32 +157,38 @@ function App() {
     };
 
     const capturar = (comUI: boolean) => {
-        let captureData = { comUI, x: 0, y: 0, w: 0, h: 0, type: toolMode(), points: [] as any[] };
+        let cx = 0, cy = 0, cw = 0, ch = 0;
+        let lassoStr = ""; // Nova string para armazenar as coordenadas do polígono
 
         if (toolMode() === 'rect') {
             const { x, y, w, h } = rect();
             if (w === 0 || h === 0) return alert("Selecione uma área primeiro!");
-            captureData = { ...captureData, x, y, w, h };
+            cx = x; cy = y; cw = w; ch = h;
         } else {
             if (lassoPoints().length < 3) return alert("Desenhe uma área com o laço!");
-            // Calcula o bounding box (caixa ao redor do laço) para enviar ao backend
             const xs = lassoPoints().map(p => p.x);
             const ys = lassoPoints().map(p => p.y);
-            const minX = Math.min(...xs);
-            const maxX = Math.max(...xs);
-            const minY = Math.min(...ys);
-            const maxY = Math.max(...ys);
+            cx = Math.min(...xs);
+            cy = Math.min(...ys);
+            cw = Math.max(...xs) - cx;
+            ch = Math.max(...ys) - cy;
 
-            captureData = { ...captureData, x: minX, y: minY, w: maxX - minX, h: maxY - minY, points: lassoPoints() };
+            // Converte os pontos para string no formato: x1,y1;x2,y2;x3,y3...
+            lassoStr = lassoPoints().map(p => `${Math.round(p.x)},${Math.round(p.y)}`).join(';');
         }
 
-        // @ts-ignore
-        if (window.takeScreenshot) {
-            // @ts-ignore
-            window.takeScreenshot(JSON.stringify(captureData));
-        }
+        // Novo formato: comUI | X | Y | W | H | p1_x,p1_y;p2_x,p2_y...
+        const dataString = `${comUI ? 1 : 0}|${Math.round(cx)}|${Math.round(cy)}|${Math.round(cw)}|${Math.round(ch)}|${lassoStr}`;
 
         fechar();
+
+        setTimeout(() => {
+            // @ts-ignore
+            if (window.takeScreenshot) {
+                // @ts-ignore
+                window.takeScreenshot(dataString);
+            }
+        }, 50);
     };
 
     // Calcula o desenho da máscara com o recorte (furo) embutido

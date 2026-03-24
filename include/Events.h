@@ -1,12 +1,8 @@
 #pragma once
 
-#include <commctrl.h>
-#pragma comment(lib, "comctl32.lib")
+#include "Settings.h"
 
-#include "Settings.h" // Incluimos Settings para reconhecer o Enum ScreenshotFormat
-
-// Apenas declaramos que estas funções existem.
-// A implementação real vai para o src/Events.cpp
 
 void SetupInputHook();
 void CaptureFrame(ScreenshotFormat format);
+void TriggerRegionScreenshot(bool withUI, int x, int y, int w, int h, const std::vector<std::pair<int, int>>& lassoPoints);
