@@ -167,3 +167,10 @@ body, html {
     right: -6px;
     cursor: ew-resize;
 }
+
+.keybind-hint {
+    font-size: 0.85em;
+    color: #b2bec3;
+    margin-left: 5px;
+    font-weight: normal;
+}

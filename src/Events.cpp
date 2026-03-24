@@ -11,6 +11,7 @@
 #include "MinHook.h"
 #include <Xinput.h>
 #include <shlobj.h>
+#include "Prisma.h"
 
 #pragma comment(lib, "Xinput9_1_0.lib")
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -22,16 +23,12 @@
 #include <commctrl.h>
 #pragma comment(lib, "comctl32.lib")
 
-
 HWND g_hWindow = nullptr;
 static XINPUT_STATE g_lastGamepadState;
 static bool g_gamepadConnected = false;
 static constexpr UINT_PTR SCREENSHOT_SUBCLASS_ID = 0x5353484F54;
 int g_captureDelayFrames = 0;
 
-// -----------------------------------------------------------
-// GLOBAIS E HOOKS
-// -----------------------------------------------------------
 static bool g_captureNextFrameWithUI = false;
 static bool g_captureNextFrameWithoutUI = false;
 static ScreenshotFormat g_pendingFormat;
@@ -42,13 +39,11 @@ Present_t OriginalPresent = nullptr;
 typedef int64_t(*RenderUI_t)(int64_t);
 RenderUI_t OriginalRenderUI = nullptr;
 
-
-// --- VARIÁVEIS DE RECORTE E ATRASO ---
 struct CropData {
     bool active = false;
     int x = 0, y = 0, w = 0, h = 0;
     std::vector<std::pair<int, int>> lassoPoints;
-} g_crop;
+} g_crop, g_pendingCrop;
 
 bool IsPointInPolygon(int x, int y, const std::vector<std::pair<int, int>>& polygon) {
     bool inside = false;
@@ -61,55 +56,54 @@ bool IsPointInPolygon(int x, int y, const std::vector<std::pair<int, int>>& poly
     return inside;
 }
 
-// -----------------------------------------------------------
-// GESTÃO DE HOOKS
-// -----------------------------------------------------------
 void TriggerScreenshotRequest(ScreenshotFormat format, bool withoutUI = false) {
     g_pendingFormat = format;
-    if (withoutUI) {
-        g_captureNextFrameWithoutUI = true;
-    }
-    else {
-        g_captureNextFrameWithUI = true;
-    }
+    if (withoutUI) g_captureNextFrameWithoutUI = true;
+    else g_captureNextFrameWithUI = true;
 }
 
-// Função chamada pelo Prisma.cpp
 void TriggerRegionScreenshot(bool withUI, int x, int y, int w, int h, const std::vector<std::pair<int, int>>& lassoPoints) {
     g_crop.active = true;
-    g_crop.x = x;
-    g_crop.y = y;
-    g_crop.w = w;
-    g_crop.h = h;
+    g_crop.x = x; g_crop.y = y; g_crop.w = w; g_crop.h = h;
     g_crop.lassoPoints = lassoPoints;
 
     g_captureDelayFrames = 1;
     TriggerScreenshotRequest(Settings::imageFormat, !withUI);
 }
 
+// Sincroniza em tempo real com o JS
+void UpdatePendingCrop(int x, int y, int w, int h, const std::vector<std::pair<int, int>>& points) {
+    g_pendingCrop.x = x; g_pendingCrop.y = y; g_pendingCrop.w = w; g_pendingCrop.h = h;
+    g_pendingCrop.lassoPoints = points;
+}
+
+// Executado quando aperta o hotkey do C++
+void ApplyPendingCropAndTrigger(bool withUI) {
+    g_crop.active = true;
+    g_crop.x = g_pendingCrop.x; g_crop.y = g_pendingCrop.y;
+    g_crop.w = g_pendingCrop.w; g_crop.h = g_pendingCrop.h;
+    g_crop.lassoPoints = g_pendingCrop.lassoPoints;
+
+    g_captureDelayFrames = 5;
+    TriggerScreenshotRequest(Settings::imageFormat, !withUI);
+}
 
 void CopyFileToClipboard(const std::string& filePath) {
     if (!OpenClipboard(nullptr)) return;
     EmptyClipboard();
-
     int len = MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, NULL, 0);
     if (len > 0) {
         std::wstring wPath(len, 0);
         MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, &wPath[0], len);
-
-        // GHND já zera a memória, gerando o null terminator duplo necessário pelo DROPFILES
         size_t dropSize = sizeof(DROPFILES) + (wPath.length() + 1) * sizeof(wchar_t);
         HGLOBAL hMem = GlobalAlloc(GHND, dropSize);
         if (hMem) {
             DROPFILES* pDrop = (DROPFILES*)GlobalLock(hMem);
-            pDrop->pFiles = sizeof(DROPFILES);
-            pDrop->fWide = TRUE;
-
+            pDrop->pFiles = sizeof(DROPFILES); pDrop->fWide = TRUE;
             char* pData = (char*)pDrop + sizeof(DROPFILES);
             memcpy(pData, wPath.c_str(), wPath.length() * sizeof(wchar_t));
-
             GlobalUnlock(hMem);
-            SetClipboardData(CF_HDROP, hMem); // Manda como arquivo pro Windows!
+            SetClipboardData(CF_HDROP, hMem);
         }
     }
     CloseClipboard();
@@ -118,23 +112,15 @@ void CopyFileToClipboard(const std::string& filePath) {
 void UnmapActionByName(const char* actionName) {
     auto controlMap = RE::ControlMap::GetSingleton();
     if (!controlMap) return;
-
     RE::BSFixedString eventName(actionName);
-
     for (uint32_t i = 0; i < RE::UserEvents::INPUT_CONTEXT_ID::kTotal; i++) {
         auto context = controlMap->controlMap[i];
         if (!context) continue;
-
         for (uint32_t deviceIdx = 0; deviceIdx < 3; deviceIdx++) {
             auto& deviceMap = context->deviceMappings[deviceIdx];
             for (auto& mapping : deviceMap) {
-                if (mapping.eventID == eventName) {
-                    if (mapping.inputKey != 0xFF) {
-                        SKSE::log::info("Acao '{}' desmapeada. Contexto: {}, Dispositivo: {}", actionName, i, deviceIdx);
-                        mapping.inputKey = 0xFF;
-                        mapping.modifier = 0xFF;
-                        mapping.remappable = false;
-                    }
+                if (mapping.eventID == eventName && mapping.inputKey != 0xFF) {
+                    mapping.inputKey = 0xFF; mapping.modifier = 0xFF; mapping.remappable = false;
                 }
             }
         }
@@ -142,7 +128,6 @@ void UnmapActionByName(const char* actionName) {
 }
 
 void UnmapNativeScreenshot() {
-    SKSE::log::info("Iniciando remocao de atalhos nativos...");
     UnmapActionByName("Screenshot");
     UnmapActionByName("Multi-Screenshot");
 }
@@ -150,52 +135,29 @@ void UnmapNativeScreenshot() {
 bool IsInputDown(uint32_t keyCode) {
     int vk = 0;
     switch (keyCode) {
-    case 256: vk = VK_LBUTTON; break;
-    case 257: vk = VK_RBUTTON; break;
-    case 258: vk = VK_MBUTTON; break;
-    case 259: vk = VK_XBUTTON1; break;
-    case 260: vk = VK_XBUTTON2; break;
-    case 183: vk = VK_SNAPSHOT; break;
-    case 199: vk = VK_HOME; break;
-    case 200: vk = VK_UP; break;
-    case 201: vk = VK_PRIOR; break;
-    case 203: vk = VK_LEFT; break;
-    case 205: vk = VK_RIGHT; break;
-    case 207: vk = VK_END; break;
-    case 208: vk = VK_DOWN; break;
-    case 209: vk = VK_NEXT; break;
-    case 210: vk = VK_INSERT; break;
-    case 211: vk = VK_DELETE; break;
-    case 156: vk = VK_RETURN; break;
-    case 157: vk = VK_RCONTROL; break;
+    case 256: vk = VK_LBUTTON; break; case 257: vk = VK_RBUTTON; break; case 258: vk = VK_MBUTTON; break;
+    case 259: vk = VK_XBUTTON1; break; case 260: vk = VK_XBUTTON2; break; case 183: vk = VK_SNAPSHOT; break;
+    case 199: vk = VK_HOME; break; case 200: vk = VK_UP; break; case 201: vk = VK_PRIOR; break;
+    case 203: vk = VK_LEFT; break; case 205: vk = VK_RIGHT; break; case 207: vk = VK_END; break;
+    case 208: vk = VK_DOWN; break; case 209: vk = VK_NEXT; break; case 210: vk = VK_INSERT; break;
+    case 211: vk = VK_DELETE; break; case 156: vk = VK_RETURN; break; case 157: vk = VK_RCONTROL; break;
     case 184: vk = VK_RMENU; break;
-    default:
-        if (keyCode < 256) vk = MapVirtualKey(keyCode, MAPVK_VSC_TO_VK);
-        break;
+    default: if (keyCode < 256) vk = MapVirtualKey(keyCode, MAPVK_VSC_TO_VK); break;
     }
-
     if (vk != 0) return (GetAsyncKeyState(vk) & 0x8000) != 0;
     return false;
 }
 
 bool CheckGamepadButton(const XINPUT_GAMEPAD& pad, uint32_t key) {
     switch (key) {
-    case 266: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP);
-    case 267: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN);
-    case 268: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT);
-    case 269: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT);
-    case 270: return (pad.wButtons & XINPUT_GAMEPAD_START);
-    case 271: return (pad.wButtons & XINPUT_GAMEPAD_BACK);
-    case 272: return (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB);
-    case 273: return (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB);
-    case 274: return (pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER);
-    case 275: return (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER);
-    case 276: return (pad.wButtons & XINPUT_GAMEPAD_A);
-    case 277: return (pad.wButtons & XINPUT_GAMEPAD_B);
-    case 278: return (pad.wButtons & XINPUT_GAMEPAD_X);
-    case 279: return (pad.wButtons & XINPUT_GAMEPAD_Y);
-    case 280: return pad.bLeftTrigger > 128;
-    case 281: return pad.bRightTrigger > 128;
+    case 266: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP); case 267: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN);
+    case 268: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT); case 269: return (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT);
+    case 270: return (pad.wButtons & XINPUT_GAMEPAD_START); case 271: return (pad.wButtons & XINPUT_GAMEPAD_BACK);
+    case 272: return (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB); case 273: return (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB);
+    case 274: return (pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER); case 275: return (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER);
+    case 276: return (pad.wButtons & XINPUT_GAMEPAD_A); case 277: return (pad.wButtons & XINPUT_GAMEPAD_B);
+    case 278: return (pad.wButtons & XINPUT_GAMEPAD_X); case 279: return (pad.wButtons & XINPUT_GAMEPAD_Y);
+    case 280: return pad.bLeftTrigger > 128; case 281: return pad.bRightTrigger > 128;
     }
     return false;
 }
@@ -204,85 +166,51 @@ std::string GetScreenshotPath(const char* ext) {
     char filename[64];
     std::time_t now = std::time(nullptr);
     std::strftime(filename, sizeof(filename), "Screenshot_%Y%m%d_%H%M%S", std::localtime(&now));
-
     std::filesystem::path basePath(Settings::screenshotPath);
     if (Settings::screenshotPath.empty()) basePath = std::filesystem::current_path();
-
-    try {
-        if (!std::filesystem::exists(basePath)) std::filesystem::create_directories(basePath);
-    }
-    catch (const std::exception& e) {
-        basePath = std::filesystem::current_path();
-    }
-
+    try { if (!std::filesystem::exists(basePath)) std::filesystem::create_directories(basePath); }
+    catch (...) { basePath = std::filesystem::current_path(); }
     return (basePath / (std::string(filename) + ext)).string();
 }
 
-
-// -----------------------------------------------------------
-// CORE DA CAPTURA (Trata os casos de DX11 / DX12)
-// -----------------------------------------------------------
 void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat format, bool withoutUI) {
     if (!swapChain) return;
-
     Microsoft::WRL::ComPtr<ID3D11Device> device11;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context11;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer11;
-    bool captured = false;
-
-    // Verificar se estamos no ambiente DX12 FrameGen (Community Shaders / Upscalers)
-    bool isDX12Interop = false;
+    bool captured = false; bool isDX12Interop = false;
     Microsoft::WRL::ComPtr<ID3D12Device> device12;
     if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D12Device), (void**)device12.GetAddressOf()))) {
         isDX12Interop = true;
         if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer11.GetAddressOf())) && backBuffer11) {
             backBuffer11->GetDevice(device11.GetAddressOf());
-            if (device11) {
-                device11->GetImmediateContext(context11.GetAddressOf());
-                if (context11) captured = true;
-            }
+            if (device11) { device11->GetImmediateContext(context11.GetAddressOf()); if (context11) captured = true; }
         }
     }
-
     if (!captured) {
         if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer11.GetAddressOf())) && backBuffer11) {
             backBuffer11->GetDevice(device11.GetAddressOf());
-            if (device11) {
-                device11->GetImmediateContext(context11.GetAddressOf());
-                if (context11) captured = true;
-            }
+            if (device11) { device11->GetImmediateContext(context11.GetAddressOf()); if (context11) captured = true; }
         }
     }
-
     if (!captured || !backBuffer11 || !context11 || !device11) return;
 
-    // --- 1. CAPTURAR A TEXTURA DA UI (kFRAMEBUFFER) ---
-    // Apenas capturamos a UI se NÃO pedirmos clean screenshot E se estivermos num proxy FrameGen (DX12)
-    // Em DX11 Vanilla, a UI já vem desenhada no backbuffer!
     auto renderer = RE::BSGraphics::Renderer::GetSingleton();
     Microsoft::WRL::ComPtr<ID3D11Resource> uiResource;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> uiTexture11;
     bool hasUI = false;
-
     if (renderer && !withoutUI && isDX12Interop) {
         auto uiRTV = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV;
         if (uiRTV) {
             uiRTV->GetResource(uiResource.GetAddressOf());
-            if (SUCCEEDED(uiResource.As(&uiTexture11))) {
-                hasUI = true;
-            }
+            if (SUCCEEDED(uiResource.As(&uiTexture11))) hasUI = true;
         }
     }
 
-    // --- 2. CRIAR STAGING DO JOGO ---
-    D3D11_TEXTURE2D_DESC desc{};
-    backBuffer11->GetDesc(&desc);
-
+    D3D11_TEXTURE2D_DESC desc{}; backBuffer11->GetDesc(&desc);
     D3D11_TEXTURE2D_DESC stagingDesc = desc;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.MiscFlags = 0;
+    stagingDesc.BindFlags = 0; stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.Usage = D3D11_USAGE_STAGING; stagingDesc.MiscFlags = 0;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTex;
     if (FAILED(device11->CreateTexture2D(&stagingDesc, nullptr, stagingTex.GetAddressOf()))) return;
@@ -291,96 +219,57 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(context11->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
 
-    // --- 3. CRIAR STAGING DA UI (Se existir proxy DX12) ---
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingUITex;
     D3D11_MAPPED_SUBRESOURCE mappedUI = { 0 };
-
     if (hasUI) {
-        D3D11_TEXTURE2D_DESC uiDesc{};
-        uiTexture11->GetDesc(&uiDesc);
+        D3D11_TEXTURE2D_DESC uiDesc{}; uiTexture11->GetDesc(&uiDesc);
         D3D11_TEXTURE2D_DESC stagingUIDesc = uiDesc;
-        stagingUIDesc.BindFlags = 0;
-        stagingUIDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        stagingUIDesc.Usage = D3D11_USAGE_STAGING;
-        stagingUIDesc.MiscFlags = 0;
-
+        stagingUIDesc.BindFlags = 0; stagingUIDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        stagingUIDesc.Usage = D3D11_USAGE_STAGING; stagingUIDesc.MiscFlags = 0;
         if (SUCCEEDED(device11->CreateTexture2D(&stagingUIDesc, nullptr, stagingUITex.GetAddressOf()))) {
             context11->CopyResource(stagingUITex.Get(), uiTexture11.Get());
             if (FAILED(context11->Map(stagingUITex.Get(), 0, D3D11_MAP_READ, 0, &mappedUI))) hasUI = false;
         }
-        else {
-            hasUI = false;
-        }
+        else hasUI = false;
     }
 
-    // --- 4. RECORTAR E BLENDING ---
-    int windowWidth = desc.Width;
-    int windowHeight = desc.Height;
-    int targetWidth = windowWidth;
-    int targetHeight = windowHeight;
-    int startX = 0;
-    int startY = 0;
+    int windowWidth = desc.Width; int windowHeight = desc.Height;
+    int targetWidth = windowWidth; int targetHeight = windowHeight;
+    int startX = 0; int startY = 0;
 
     if (g_crop.active) {
-        // Se a chamada veio da UI, pegamos o recorte
-        startX = g_crop.x;
-        startY = g_crop.y;
-        targetWidth = g_crop.w;
-        targetHeight = g_crop.h;
-
-        // Limita as bordas para não crashar o jogo se arrastar pra fora da tela
-        if (startX < 0) startX = 0;
-        if (startY < 0) startY = 0;
+        startX = g_crop.x; startY = g_crop.y; targetWidth = g_crop.w; targetHeight = g_crop.h;
+        if (startX < 0) startX = 0; if (startY < 0) startY = 0;
         if (startX + targetWidth > windowWidth) targetWidth = windowWidth - startX;
         if (startY + targetHeight > windowHeight) targetHeight = windowHeight - startY;
-
-        g_crop.active = false; // Desativa o recorte para não afetar screenshots normais
+        g_crop.active = false;
     }
     else {
-        // Lógica original para quando aperta o botão de screenshot normal do gamepad
-        targetWidth = Settings::useCustomResolution ? (std::min)((int)Settings::customWidth, windowWidth) : windowWidth;
-        targetHeight = Settings::useCustomResolution ? (std::min)((int)Settings::customHeight, windowHeight) : windowHeight;
-        startX = (windowWidth - targetWidth) / 2;
-        startY = (windowHeight - targetHeight) / 2;
+        targetWidth = windowWidth; targetHeight = windowHeight;
+        startX = 0; startY = 0;
     }
 
     std::vector<uint8_t> pixelData(targetWidth * targetHeight * 4);
     uint8_t* src = (uint8_t*)mapped.pData;
     uint8_t* dst = pixelData.data();
-
     bool isBGRA = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-
     bool useLasso = !g_crop.lassoPoints.empty();
+
     for (int y = 0; y < targetHeight; ++y) {
         uint8_t* rowSrc = src + ((startY + y) * mapped.RowPitch) + (startX * 4);
         uint8_t* rowDst = dst + (y * targetWidth * 4);
         uint8_t* rowUI = hasUI ? (uint8_t*)mappedUI.pData + ((startY + y) * mappedUI.RowPitch) + (startX * 4) : nullptr;
-
         for (int x = 0; x < targetWidth; ++x) {
             int p = x * 4;
-
-            // --- CHECAGEM DO LAÇO (MISSÃO 2) ---
             if (useLasso) {
-                int globalX = startX + x;
-                int globalY = startY + y;
-                // Se o pixel estiver fora do polígono que desenhamos...
-                if (!IsPointInPolygon(globalX, globalY, g_crop.lassoPoints)) {
-                    rowDst[p + 0] = 0;
-                    rowDst[p + 1] = 0;
-                    rowDst[p + 2] = 0;
-                    rowDst[p + 3] = 0; // ...ele vira 100% transparente (Alpha 0)
+                if (!IsPointInPolygon(startX + x, startY + y, g_crop.lassoPoints)) {
+                    rowDst[p + 0] = 0; rowDst[p + 1] = 0; rowDst[p + 2] = 0; rowDst[p + 3] = 0;
                     continue;
                 }
             }
-
             float gameR, gameG, gameB;
-
-            if (isBGRA) {
-                gameR = rowSrc[p + 2]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 0];
-            }
-            else {
-                gameR = rowSrc[p + 0]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 2];
-            }
+            if (isBGRA) { gameR = rowSrc[p + 2]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 0]; }
+            else { gameR = rowSrc[p + 0]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 2]; }
 
             if (hasUI && rowUI) {
                 float uiR = rowUI[p + 0]; float uiG = rowUI[p + 1]; float uiB = rowUI[p + 2];
@@ -400,33 +289,22 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     if (hasUI) context11->Unmap(stagingUITex.Get(), 0);
     context11->Unmap(stagingTex.Get(), 0);
 
-    // --- 5. SALVAR ---
     std::string path = GetScreenshotPath(format == ScreenshotFormat::PNG ? ".png" : (format == ScreenshotFormat::JPG ? ".jpg" : ".bmp"));
     int success = 0;
-
     if (format == ScreenshotFormat::PNG) success = stbi_write_png(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), targetWidth * 4);
     else if (format == ScreenshotFormat::JPG) success = stbi_write_jpg(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), 90);
     else success = stbi_write_bmp(path.c_str(), targetWidth, targetHeight, 4, pixelData.data());
 
-    if (success) {
-        logger::info("Screenshot salvo com sucesso: {}", path);
-        CopyFileToClipboard(path);
-    }
+    if (success) { CopyFileToClipboard(path); }
 }
 
-
-
-// Intercepta a chamada que desenha a UI. Excelente para fotos LIMPAS!
 int64_t Hooked_RenderUI(int64_t gMenuManager) {
     if (g_captureNextFrameWithoutUI) {
-        if (g_captureDelayFrames > 0) {
-            g_captureDelayFrames--; // Conta os frames de atraso pra dar tempo da UI fechar
-        }
+        if (g_captureDelayFrames > 0) g_captureDelayFrames--;
         else {
             auto renderer = RE::BSGraphics::Renderer::GetSingleton();
             if (renderer && renderer->GetRuntimeData().renderWindows[0].swapChain) {
-                auto swapChain = reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain);
-                CaptureFrameFromSwapChain(swapChain, g_pendingFormat, true);
+                CaptureFrameFromSwapChain(reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain), g_pendingFormat, true);
             }
             g_captureNextFrameWithoutUI = false;
         }
@@ -434,12 +312,9 @@ int64_t Hooked_RenderUI(int64_t gMenuManager) {
     return OriginalRenderUI(gMenuManager);
 }
 
-// Intercepta o final do frame. Excelente para fotos com UI incluída!
 HRESULT WINAPI Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (g_captureNextFrameWithUI) {
-        if (g_captureDelayFrames > 0) {
-            g_captureDelayFrames--; // Conta os frames de atraso pra dar tempo da UI fechar
-        }
+        if (g_captureDelayFrames > 0) g_captureDelayFrames--;
         else {
             CaptureFrameFromSwapChain(pSwapChain, g_pendingFormat, false);
             g_captureNextFrameWithUI = false;
@@ -447,92 +322,96 @@ HRESULT WINAPI Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UIN
     }
     return OriginalPresent(pSwapChain, SyncInterval, Flags);
 }
+
 void InstallHooks() {
     auto renderer = RE::BSGraphics::Renderer::GetSingleton();
     if (!renderer) return;
-
-    // 1. Hook de IDXGISwapChain::Present (Para fotos COM UI)
     auto swapChain = reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain);
     if (swapChain) {
         void** vtable = *(void***)swapChain;
         OriginalPresent = (Present_t)vtable[8];
-
-        DWORD oldProtect;
-        VirtualProtect(&vtable[8], sizeof(void*), PAGE_READWRITE, &oldProtect);
-        vtable[8] = Hooked_Present;
-        VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &oldProtect);
-        logger::info("Hook de IDXGISwapChain::Present instalado com sucesso.");
+        DWORD oldProtect; VirtualProtect(&vtable[8], sizeof(void*), PAGE_READWRITE, &oldProtect);
+        vtable[8] = Hooked_Present; VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &oldProtect);
     }
-
-    // 2. Hook de RenderUI (Para fotos SEM UI)
-    // Usamos o Trampoline do SKSE para intercetar o "call" do MenuManager::Render
     SKSE::AllocTrampoline(14);
     auto& trampoline = SKSE::GetTrampoline();
     OriginalRenderUI = reinterpret_cast<RenderUI_t>(trampoline.write_call<5>(
-        REL::RelocationID(35556, 36555).address() + REL::Relocate(0x3ab, 0x371),
-        (uintptr_t)Hooked_RenderUI
-    ));
-    logger::info("Hook de RenderUI instalado com sucesso.");
+        REL::RelocationID(35556, 36555).address() + REL::Relocate(0x3ab, 0x371), (uintptr_t)Hooked_RenderUI));
 }
 
-void PollGamepad() {
-    XINPUT_STATE currentState;
-    ZeroMemory(&currentState, sizeof(XINPUT_STATE));
+// Variáveis para rastrear o estado das teclas e evitar que 1 clique dispare 10 fotos
+static bool g_wasCapUIPressedAsync = false;
+static bool g_wasCapNoUIPressedAsync = false;
 
-    if (XInputGetState(0, &currentState) != ERROR_SUCCESS) {
-        g_gamepadConnected = false;
-        return;
+void PollAsyncInputs() {
+    // --- 1. TECLADO/MOUSE ASYNC (Ignora o roubo de foco do Windows) ---
+    if (!Prisma::IsHidden()) {
+        bool capUI_k = Settings::captureWithUIKey_k != 0 && IsInputDown(Settings::captureWithUIKey_k);
+        bool capUI_m = Settings::captureWithUIKey_m != 0 && IsInputDown(Settings::captureWithUIKey_m);
+        bool capUI_pressed = capUI_k || capUI_m;
+
+        if (capUI_pressed && !g_wasCapUIPressedAsync) {
+            bool comboHeld = (Settings::captureWithUICombo_k == 0) || IsInputDown(Settings::captureWithUICombo_k);
+            if (comboHeld) {
+                Prisma::Hide();
+                ApplyPendingCropAndTrigger(true);
+            }
+        }
+        g_wasCapUIPressedAsync = capUI_pressed;
+
+        bool capNoUI_k = Settings::captureNoUIKey_k != 0 && IsInputDown(Settings::captureNoUIKey_k);
+        bool capNoUI_m = Settings::captureNoUIKey_m != 0 && IsInputDown(Settings::captureNoUIKey_m);
+        bool capNoUI_pressed = capNoUI_k || capNoUI_m;
+
+        if (capNoUI_pressed && !g_wasCapNoUIPressedAsync) {
+            bool comboHeld = (Settings::captureNoUICombo_k == 0) || IsInputDown(Settings::captureNoUICombo_k);
+            if (comboHeld) {
+                Prisma::Hide();
+                ApplyPendingCropAndTrigger(false);
+            }
+        }
+        g_wasCapNoUIPressedAsync = capNoUI_pressed;
     }
-    if (!g_gamepadConnected) {
-        g_gamepadConnected = true;
-        g_lastGamepadState = currentState;
-        return;
-    }
+
+    // --- 2. GAMEPAD (Sua lógica original mantida aqui dentro) ---
+    XINPUT_STATE currentState; ZeroMemory(&currentState, sizeof(XINPUT_STATE));
+    if (XInputGetState(0, &currentState) != ERROR_SUCCESS) { g_gamepadConnected = false; return; }
+    if (!g_gamepadConnected) { g_gamepadConnected = true; g_lastGamepadState = currentState; return; }
     if (currentState.dwPacketNumber == g_lastGamepadState.dwPacketNumber) return;
 
-    auto& pad = currentState.Gamepad;
-    auto& oldPad = g_lastGamepadState.Gamepad;
+    auto& pad = currentState.Gamepad; auto& oldPad = g_lastGamepadState.Gamepad;
+    auto IsPressed = [&](uint32_t key) -> bool { return key != 0 && CheckGamepadButton(pad, key) && !CheckGamepadButton(oldPad, key); };
+    auto IsHeld = [&](uint32_t key) -> bool { return key == 0 || CheckGamepadButton(pad, key); };
 
-    auto IsPressed = [&](uint32_t key) -> bool {
-        if (key == 0) return false;
-        return CheckGamepadButton(pad, key) && !CheckGamepadButton(oldPad, key);
-        };
-    auto IsHeld = [&](uint32_t key) -> bool {
-        if (key == 0) return true;
-        return CheckGamepadButton(pad, key);
-        };
+    bool triggerOpen = false;
+    if (IsPressed(Settings::openModeKey_g)) { if (IsHeld(Settings::openModeCombo_g)) triggerOpen = true; }
+    else if (IsPressed(Settings::openModeCombo_g)) { if (IsHeld(Settings::openModeKey_g)) triggerOpen = true; }
+    if (triggerOpen) {
+        if (Prisma::IsHidden()) Prisma::Show();
+        else Prisma::Hide();
+    }
 
-    // --- LÓGICA DE SCREENSHOT NORMAL (COM UI) ---
-    bool triggerSS = false;
-    if (IsPressed(Settings::screenshotKey_g)) {
-        if (IsHeld(Settings::comboKey_g)) triggerSS = true;
+    bool triggerCapUI = false;
+    if (IsPressed(Settings::captureWithUIKey_g)) { if (IsHeld(Settings::captureWithUICombo_g)) triggerCapUI = true; }
+    else if (IsPressed(Settings::captureWithUICombo_g)) { if (IsHeld(Settings::captureWithUIKey_g)) triggerCapUI = true; }
+    if (triggerCapUI && !Prisma::IsHidden()) {
+        Prisma::Hide();
+        ApplyPendingCropAndTrigger(true);
     }
-    else if (IsPressed(Settings::comboKey_g)) {
-        if (IsHeld(Settings::screenshotKey_g)) triggerSS = true;
-    }
-    if (triggerSS) TriggerScreenshotRequest(Settings::imageFormat, false);
 
-    // --- LÓGICA SCREENSHOT SEM UI ---
-    bool triggerSSNoUI = false;
-    if (IsPressed(Settings::toggleUIKey_g)) {
-        if (IsHeld(Settings::toggleUIComboKey_g)) triggerSSNoUI = true;
+    bool triggerCapNoUI = false;
+    if (IsPressed(Settings::captureNoUIKey_g)) { if (IsHeld(Settings::captureNoUICombo_g)) triggerCapNoUI = true; }
+    else if (IsPressed(Settings::captureNoUICombo_g)) { if (IsHeld(Settings::captureNoUIKey_g)) triggerCapNoUI = true; }
+    if (triggerCapNoUI && !Prisma::IsHidden()) {
+        Prisma::Hide();
+        ApplyPendingCropAndTrigger(false);
     }
-    else if (IsPressed(Settings::toggleUIComboKey_g)) {
-        if (IsHeld(Settings::toggleUIKey_g)) triggerSSNoUI = true;
-    }
-    if (triggerSSNoUI) TriggerScreenshotRequest(Settings::imageFormat, true);
-
     g_lastGamepadState = currentState;
 }
 
 LRESULT CALLBACK MySubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    if (msg == WM_TIMER && wParam == 0x5353) {
-        PollGamepad();
-    }
-
-    uint32_t pressedKey = 0;
-    bool isKeyboard = false;
-
+    if (msg == WM_TIMER && wParam == 0x5353) PollAsyncInputs();
+    uint32_t pressedKey = 0; bool isKeyboard = false;
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         pressedKey = MapVirtualKey(static_cast<UINT>(wParam), MAPVK_VK_TO_VSC);
         if ((lParam >> 24) & 1) pressedKey += 128;
@@ -542,46 +421,49 @@ LRESULT CALLBACK MySubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam == VK_SNAPSHOT) pressedKey = 183;
         isKeyboard = true;
     }
-    else if (msg == WM_LBUTTONDOWN) { pressedKey = 256; }
-    else if (msg == WM_RBUTTONDOWN) { pressedKey = 257; }
-    else if (msg == WM_MBUTTONDOWN) { pressedKey = 258; }
-    else if (msg == WM_XBUTTONDOWN) {
-        pressedKey = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 259 : 260;
-    }
-    else {
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    }
+    else if (msg == WM_LBUTTONDOWN) pressedKey = 256;
+    else if (msg == WM_RBUTTONDOWN) pressedKey = 257;
+    else if (msg == WM_MBUTTONDOWN) pressedKey = 258;
+    else if (msg == WM_XBUTTONDOWN) pressedKey = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 259 : 260;
+    else return DefSubclassProc(hwnd, msg, wParam, lParam);
 
     if (pressedKey != 0) {
         bool blockInput = false;
 
-        bool isSS_Trigger = (isKeyboard && Settings::screenshotKey_k != 0 && pressedKey == Settings::screenshotKey_k) ||
-            (!isKeyboard && Settings::screenshotKey_m != 0 && pressedKey == Settings::screenshotKey_m);
-
-        if (isSS_Trigger) {
-            bool comboHeld = (Settings::comboKey_k == 0) || IsInputDown(Settings::comboKey_k);
+        bool isOpen_Trigger = (isKeyboard && Settings::openModeKey_k != 0 && pressedKey == Settings::openModeKey_k) ||
+            (!isKeyboard && Settings::openModeKey_m != 0 && pressedKey == Settings::openModeKey_m);
+        if (isOpen_Trigger) {
+            bool comboHeld = (Settings::openModeCombo_k == 0) || IsInputDown(Settings::openModeCombo_k);
             if (comboHeld) {
-                TriggerScreenshotRequest(Settings::imageFormat, false);
-                RE::SendHUDMessage::ShowHUDMessage("Screenshot captured!");
+                if (Prisma::IsHidden()) Prisma::Show();
+                else Prisma::Hide();
                 blockInput = true;
             }
         }
 
-        bool isSSNoUI_Trigger = (isKeyboard && Settings::toggleUIKey_k != 0 && pressedKey == Settings::toggleUIKey_k) ||
-            (!isKeyboard && Settings::toggleUIKey_m != 0 && pressedKey == Settings::toggleUIKey_m);
-
-        if (isSSNoUI_Trigger) {
-            bool comboHeld = (Settings::toggleUIComboKey_k == 0) || IsInputDown(Settings::toggleUIComboKey_k);
+        bool isCapUI_Trigger = (isKeyboard && Settings::captureWithUIKey_k != 0 && pressedKey == Settings::captureWithUIKey_k) ||
+            (!isKeyboard && Settings::captureWithUIKey_m != 0 && pressedKey == Settings::captureWithUIKey_m);
+        if (isCapUI_Trigger && !Prisma::IsHidden()) {
+            bool comboHeld = (Settings::captureWithUICombo_k == 0) || IsInputDown(Settings::captureWithUICombo_k);
             if (comboHeld) {
-                TriggerScreenshotRequest(Settings::imageFormat, true);
-                RE::SendHUDMessage::ShowHUDMessage("Screenshot (No UI) captured!");
+                Prisma::Hide();
+                ApplyPendingCropAndTrigger(true);
                 blockInput = true;
             }
         }
 
+        bool isCapNoUI_Trigger = (isKeyboard && Settings::captureNoUIKey_k != 0 && pressedKey == Settings::captureNoUIKey_k) ||
+            (!isKeyboard && Settings::captureNoUIKey_m != 0 && pressedKey == Settings::captureNoUIKey_m);
+        if (isCapNoUI_Trigger && !Prisma::IsHidden()) {
+            bool comboHeld = (Settings::captureNoUICombo_k == 0) || IsInputDown(Settings::captureNoUICombo_k);
+            if (comboHeld) {
+                Prisma::Hide();
+                ApplyPendingCropAndTrigger(false);
+                blockInput = true;
+            }
+        }
         if (blockInput) return 0;
     }
-
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
@@ -589,34 +471,19 @@ void SetupInputHook() {
     auto taskInterface = SKSE::GetTaskInterface();
     if (taskInterface) {
         taskInterface->AddTask([]() {
-            INITCOMMONCONTROLSEX icex;
-            icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-            icex.dwICC = ICC_WIN95_CLASSES;
+            INITCOMMONCONTROLSEX icex; icex.dwSize = sizeof(INITCOMMONCONTROLSEX); icex.dwICC = ICC_WIN95_CLASSES;
             InitCommonControlsEx(&icex);
-
             auto renderer = RE::BSGraphics::Renderer::GetSingleton();
             if (renderer) g_hWindow = (HWND)renderer->GetRuntimeData().renderWindows[0].hWnd;
             if (!g_hWindow) g_hWindow = FindWindowA(nullptr, "Skyrim Special Edition");
-
             if (g_hWindow) {
-                DWORD windowPid = 0;
-                GetWindowThreadProcessId(g_hWindow, &windowPid);
-                DWORD currentPid = GetCurrentProcessId();
-
-                if (windowPid != currentPid) return;
-
+                DWORD windowPid = 0; GetWindowThreadProcessId(g_hWindow, &windowPid);
+                if (windowPid != GetCurrentProcessId()) return;
                 if (SetWindowSubclass(g_hWindow, MySubclassProc, SCREENSHOT_SUBCLASS_ID, 0)) {
                     SetTimer(g_hWindow, 0x5353, 16, nullptr);
-                    UnmapNativeScreenshot();
-
-                    // Instalar ambos os Hooks
-                    InstallHooks();
+                    UnmapNativeScreenshot(); InstallHooks();
                 }
-            }});
+            }
+            });
     }
 }
-
-
-
-
-

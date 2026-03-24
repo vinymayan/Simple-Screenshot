@@ -11,23 +11,28 @@ enum class ScreenshotFormat : int {
 };
 
 namespace Settings {
-    // Teclado
-    inline uint32_t screenshotKey_k = 183; // Default 'Z'
-    inline uint32_t screenshotKey_m = 0; // Default 'Z'
-    inline uint32_t comboKey_k = 0;       // Tecla Combo (Ex: Shift). 0 = Desativado
+    // 1. Abrir Menu (Antigo Screenshot)
+    inline uint32_t openModeKey_k = 183; // Default PrintScreen
+    inline uint32_t openModeKey_m = 0;
+    inline uint32_t openModeCombo_k = 0;
+    inline uint32_t openModeKey_g = 0;
+    inline uint32_t openModeCombo_g = 0;
 
-    // Gamepad
-    inline uint32_t screenshotKey_g = 0;  // Botão Screenshot
-    inline uint32_t comboKey_g = 0;       // Botão Combo
+    // 2. Capturar Com UI
+    inline uint32_t captureWithUIKey_k = 0;
+    inline uint32_t captureWithUIKey_m = 0;
+    inline uint32_t captureWithUICombo_k = 0;
+    inline uint32_t captureWithUIKey_g = 0;
+    inline uint32_t captureWithUICombo_g = 0;
 
-    // Esconder UI
-    inline uint32_t toggleUIKey_k = 56;
-    inline uint32_t toggleUIKey_m = 0;
-    inline uint32_t toggleUIKey_g = 0;
-    inline uint32_t toggleUIComboKey_k = 47;
-    inline uint32_t toggleUIComboKey_g = 0;
+    // 3. Capturar Sem UI (Antigo Hide UI)
+    inline uint32_t captureNoUIKey_k = 56; // Default Alt
+    inline uint32_t captureNoUIKey_m = 0;
+    inline uint32_t captureNoUICombo_k = 47; // Default V
+    inline uint32_t captureNoUIKey_g = 0;
+    inline uint32_t captureNoUICombo_g = 0;
 
-    // Configurações
+    // Configurações e Resolução
     inline std::string screenshotPath = "Screenshots";
     inline ScreenshotFormat imageFormat = ScreenshotFormat::PNG;
     inline bool useCustomResolution = false;

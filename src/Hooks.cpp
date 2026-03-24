@@ -21,14 +21,6 @@ bool OnInput(RE::InputEvent* event) {
     auto button = event->AsButtonEvent();
     if (!button) return false;
     if (!button->IsDown()) return false;
-    if (button->GetIDCode() == RE::BSWin32KeyboardDevice::Keys::kF2) {
-        if (Prisma::IsHidden()) {
-            Prisma::Show();
-        } else {
-            Prisma::Hide();
-        }
-        return true;
-    }
     if (!Prisma::IsHidden()) {
         return true;
     }
