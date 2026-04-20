@@ -32,4 +32,5 @@ bool OnInput(RE::InputEvent* event) {
 void Hooks::Install() {
     ProcessInputQueueHook::install();
     InputEventHandler::Register(OnInput);
+	logger::info("Hooks installed");
 }

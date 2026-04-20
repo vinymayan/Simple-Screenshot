@@ -186,6 +186,7 @@ namespace ScreenshotMenu {
                 if (doc.HasMember("imageFormat")) Settings::imageFormat = static_cast<ScreenshotFormat>(doc["imageFormat"].GetInt());
                 if (doc.HasMember("screenshotPath")) Settings::screenshotPath = doc["screenshotPath"].GetString();
             }
+			logger::info("Settings loaded");
         }
     }
 
@@ -324,6 +325,7 @@ namespace ScreenshotMenu {
         if (SKSEMenuFramework::IsInstalled()) {
             SKSEMenuFramework::SetSection("Simple Screenshot");
             SKSEMenuFramework::AddSectionItem("Settings", Render);
+			logger::info("Settings menu registered");
         }
     }
 }

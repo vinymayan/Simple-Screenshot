@@ -12,6 +12,7 @@
 #include <Xinput.h>
 #include <shlobj.h>
 #include "Prisma.h"
+#include <cmath>
 
 #pragma comment(lib, "Xinput9_1_0.lib")
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -176,14 +177,153 @@ std::string GetScreenshotPath(const char* ext) {
     return (basePath / (std::string(filename) + ext)).string();
 }
 
+// Decodifica PQ (Perceptual Quantizer - SMPTE ST 2084) para Nits Reais
+inline float DecodePQ(float V) {
+    float V_clamp = std::max(0.0f, std::min(V, 1.0f));
+    float m1 = 2610.0f / 16384.0f;
+    float m2 = 2523.0f / 32.0f;
+    float c1 = 3424.0f / 4096.0f;
+    float c2 = 2413.0f / 128.0f;
+    float c3 = 2392.0f / 128.0f;
+
+    float V_pow = std::pow(V_clamp, 1.0f / m2);
+    float num = std::max(V_pow - c1, 0.0f);
+    float den = c2 - c3 * V_pow;
+    float L = std::pow(num / den, 1.0f / m1);
+
+    return L * 10000.0f; // Retorna a luminosidade exata em Nits
+}
+
+// Converte o Espaço de Cor BT.2020 (Monitor HDR) para sRGB (Monitor SDR / JPG)
+inline void ConvertBT2020TosRGB(float& r, float& g, float& b) {
+    float sR = 1.660491f * r - 0.587641f * g - 0.072850f * b;
+    float sG = -0.124550f * r + 1.132900f * g - 0.008349f * b;
+    float sB = -0.018151f * r - 0.100579f * g + 1.118730f * b;
+    r = std::max(0.0f, sR);
+    g = std::max(0.0f, sG);
+    b = std::max(0.0f, sB);
+}
+
+// Converte Cor Linear HDR para SDR usando curva ACES e Gamma sRGB
+inline float ProcessHDRtoSDR(float linearColor) {
+    // Para evitar estourar com valores extremos do HDR
+    linearColor = std::max(0.0f, linearColor);
+
+    // ACES Film Tonemapping (Mantém os brilhos altos e o contraste vívido do HDR)
+    float a = 2.51f;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    float mapped = (linearColor * (a * linearColor + b)) / (linearColor * (c * linearColor + d) + e);
+
+    // Gamma Correction (Aproximação sRGB padrão de 2.2)
+    mapped = pow(mapped, 1.0f / 2.2f);
+
+    // Clamp final de segurança
+    return mapped > 1.0f ? 1.0f : (mapped < 0.0f ? 0.0f : mapped);
+}
+
+// Converte Half-Float (16-bits) para Float padrão (32-bits)
+inline float ConvertHalfToFloat(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x00000001;
+    uint32_t exp = (h >> 10) & 0x0000001F;
+    uint32_t mant = h & 0x000003FF;
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        while ((mant & 0x00000400) == 0) { mant <<= 1; exp--; }
+        exp++; mant &= ~0x00000400;
+    }
+    else if (exp == 31) {
+        if (mant == 0) return sign ? -INFINITY : INFINITY;
+        return NAN;
+    }
+    exp = exp + (127 - 15);
+    mant = mant << 13;
+    uint32_t fBits = (sign << 31) | (exp << 23) | mant;
+    float f; memcpy(&f, &fBits, sizeof(f));
+    return f;
+}
+
+// Descobre o tamanho real do Pixel em Bytes
+inline int GetBytesPerPixel(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+        return 8;
+    default:
+        return 4; // R8G8B8A8, B8G8R8A8, R10G10B10A2
+    }
+}
+
+// Lê os canais RGBA corretamente para os formatos modernos e vanilla do Skyrim
+inline void ReadPixel(uint8_t* rowData, int x, DXGI_FORMAT format, int bpp, float& r, float& g, float& b, float& a) {
+    if (bpp == 8 && format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        uint16_t* p16 = (uint16_t*)(rowData + x * 8);
+        r = ConvertHalfToFloat(p16[0]);
+        g = ConvertHalfToFloat(p16[1]);
+        b = ConvertHalfToFloat(p16[2]);
+        a = ConvertHalfToFloat(p16[3]);
+
+        // Formatos de 16-bits costumam ser lineares (ex: ENB scRGB)
+        r = ProcessHDRtoSDR(r) * 255.0f;
+        g = ProcessHDRtoSDR(g) * 255.0f;
+        b = ProcessHDRtoSDR(b) * 255.0f;
+        a = (a > 1.0f ? 1.0f : (a < 0.0f ? 0.0f : a)) * 255.0f;
+    }
+    else if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        // Formato 10-bits usado pelo mod HDR10 - Contém curva PQ e cores BT.2020
+        uint32_t p32 = *(uint32_t*)(rowData + x * 4);
+        r = (p32 & 0x3FF) / 1023.0f;
+        g = ((p32 >> 10) & 0x3FF) / 1023.0f;
+        b = ((p32 >> 20) & 0x3FF) / 1023.0f;
+        a = ((p32 >> 30) & 0x3) / 3.0f;
+
+        // 1. Decodifica de PQ para Luminosidade Real (Nits)
+        r = DecodePQ(r);
+        g = DecodePQ(g);
+        b = DecodePQ(b);
+
+        // 2. Converte as cores para o padrão da internet (sRGB)
+        ConvertBT2020TosRGB(r, g, b);
+
+        // 3. Normaliza usando o "Paper White" padrão (203 Nits = 1.0)
+        r /= 203.0f;
+        g /= 203.0f;
+        b /= 203.0f;
+
+        // 4. Agora sim o Tonemapping ACES fará o trabalho perfeito
+        r = ProcessHDRtoSDR(r) * 255.0f;
+        g = ProcessHDRtoSDR(g) * 255.0f;
+        b = ProcessHDRtoSDR(b) * 255.0f;
+        a = a * 255.0f;
+    }
+    else {
+        uint8_t* p8 = rowData + x * 4;
+        if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            r = p8[2]; g = p8[1]; b = p8[0]; a = p8[3]; // Inverte BGRA para RGBA
+        }
+        else {
+            r = p8[0]; g = p8[1]; b = p8[2]; a = p8[3];
+        }
+        // Se cair aqui, é SDR padrão. Não precisa de Tonemap.
+    }
+}
 void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat format, bool withoutUI) {
     std::shared_ptr<void> unlocker(nullptr, [](void*) { g_isCapturing = false; });
     if (!swapChain) return;
+
     Microsoft::WRL::ComPtr<ID3D11Device> device11;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context11;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer11;
-    bool captured = false; bool isDX12Interop = false;
+    bool captured = false;
+    bool isDX12Interop = false;
     Microsoft::WRL::ComPtr<ID3D12Device> device12;
+
     if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D12Device), (void**)device12.GetAddressOf()))) {
         isDX12Interop = true;
         if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer11.GetAddressOf())) && backBuffer11) {
@@ -203,6 +343,7 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     Microsoft::WRL::ComPtr<ID3D11Resource> uiResource;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> uiTexture11;
     bool hasUI = false;
+
     if (renderer && !withoutUI && isDX12Interop) {
         auto uiRTV = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV;
         if (uiRTV) {
@@ -225,16 +366,24 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingUITex;
     D3D11_MAPPED_SUBRESOURCE mappedUI = { 0 };
+    D3D11_TEXTURE2D_DESC uiDesc{};
+
     if (hasUI) {
-        D3D11_TEXTURE2D_DESC uiDesc{}; uiTexture11->GetDesc(&uiDesc);
-        D3D11_TEXTURE2D_DESC stagingUIDesc = uiDesc;
-        stagingUIDesc.BindFlags = 0; stagingUIDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        stagingUIDesc.Usage = D3D11_USAGE_STAGING; stagingUIDesc.MiscFlags = 0;
-        if (SUCCEEDED(device11->CreateTexture2D(&stagingUIDesc, nullptr, stagingUITex.GetAddressOf()))) {
-            context11->CopyResource(stagingUITex.Get(), uiTexture11.Get());
-            if (FAILED(context11->Map(stagingUITex.Get(), 0, D3D11_MAP_READ, 0, &mappedUI))) hasUI = false;
+        uiTexture11->GetDesc(&uiDesc);
+        // Previne crash com DLSS/FSR onde a UI tem resolução nativa, mas o jogo tem resolução menor.
+        if (uiDesc.Width != desc.Width || uiDesc.Height != desc.Height) {
+            hasUI = false;
         }
-        else hasUI = false;
+        else {
+            D3D11_TEXTURE2D_DESC stagingUIDesc = uiDesc;
+            stagingUIDesc.BindFlags = 0; stagingUIDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            stagingUIDesc.Usage = D3D11_USAGE_STAGING; stagingUIDesc.MiscFlags = 0;
+            if (SUCCEEDED(device11->CreateTexture2D(&stagingUIDesc, nullptr, stagingUITex.GetAddressOf()))) {
+                context11->CopyResource(stagingUITex.Get(), uiTexture11.Get());
+                if (FAILED(context11->Map(stagingUITex.Get(), 0, D3D11_MAP_READ, 0, &mappedUI))) hasUI = false;
+            }
+            else hasUI = false;
+        }
     }
 
     int windowWidth = desc.Width; int windowHeight = desc.Height;
@@ -256,36 +405,47 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     std::vector<uint8_t> pixelData(targetWidth * targetHeight * 4);
     uint8_t* src = (uint8_t*)mapped.pData;
     uint8_t* dst = pixelData.data();
-    bool isBGRA = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
     bool useLasso = !g_crop.lassoPoints.empty();
 
+    // Calcula os offsets dependendo do formato do Game e da Interface separadamente
+    int gameBpp = GetBytesPerPixel(desc.Format);
+    int uiBpp = hasUI ? GetBytesPerPixel(uiDesc.Format) : 4;
+
     for (int y = 0; y < targetHeight; ++y) {
-        uint8_t* rowSrc = src + ((startY + y) * mapped.RowPitch) + (startX * 4);
+        uint8_t* rowSrc = src + ((startY + y) * mapped.RowPitch) + (startX * gameBpp);
+        uint8_t* rowUI = hasUI ? (uint8_t*)mappedUI.pData + ((startY + y) * mappedUI.RowPitch) + (startX * uiBpp) : nullptr;
+
+        // DECLARAÇÃO CORRIGIDA: Precisamos calcular onde fica a linha na imagem final (dst)
         uint8_t* rowDst = dst + (y * targetWidth * 4);
-        uint8_t* rowUI = hasUI ? (uint8_t*)mappedUI.pData + ((startY + y) * mappedUI.RowPitch) + (startX * 4) : nullptr;
+
         for (int x = 0; x < targetWidth; ++x) {
-            int p = x * 4;
+            int p = x * 4; // O destino 'dst' SEMPRE será um vetor 4-bytes RGBA8
+
             if (useLasso) {
                 if (!IsPointInPolygon(startX + x, startY + y, g_crop.lassoPoints)) {
                     rowDst[p + 0] = 0; rowDst[p + 1] = 0; rowDst[p + 2] = 0; rowDst[p + 3] = 0;
                     continue;
                 }
             }
-            float gameR, gameG, gameB;
-            if (isBGRA) { gameR = rowSrc[p + 2]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 0]; }
-            else { gameR = rowSrc[p + 0]; gameG = rowSrc[p + 1]; gameB = rowSrc[p + 2]; }
+
+            float gameR, gameG, gameB, gameA;
+            ReadPixel(rowSrc, x, desc.Format, gameBpp, gameR, gameG, gameB, gameA);
 
             if (hasUI && rowUI) {
-                float uiR = rowUI[p + 0]; float uiG = rowUI[p + 1]; float uiB = rowUI[p + 2];
-                float uiA = rowUI[p + 3] / 255.0f;
+                float uiR, uiG, uiB, uiA_val;
+                ReadPixel(rowUI, x, uiDesc.Format, uiBpp, uiR, uiG, uiB, uiA_val);
+                float uiA = uiA_val / 255.0f;
+
                 rowDst[p + 0] = (uint8_t)((uiR * uiA) + (gameR * (1.0f - uiA)));
                 rowDst[p + 1] = (uint8_t)((uiG * uiA) + (gameG * (1.0f - uiA)));
                 rowDst[p + 2] = (uint8_t)((uiB * uiA) + (gameB * (1.0f - uiA)));
                 rowDst[p + 3] = 255;
             }
             else {
-                rowDst[p + 0] = (uint8_t)gameR; rowDst[p + 1] = (uint8_t)gameG;
-                rowDst[p + 2] = (uint8_t)gameB; rowDst[p + 3] = 255;
+                rowDst[p + 0] = (uint8_t)gameR;
+                rowDst[p + 1] = (uint8_t)gameG;
+                rowDst[p + 2] = (uint8_t)gameB;
+                rowDst[p + 3] = 255;
             }
         }
     }
@@ -294,6 +454,7 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
     context11->Unmap(stagingTex.Get(), 0);
 
     std::string path = GetScreenshotPath(format == ScreenshotFormat::PNG ? ".png" : (format == ScreenshotFormat::JPG ? ".jpg" : ".bmp"));
+
     std::thread([format, path, targetWidth, targetHeight, pixelData = std::move(pixelData), unlocker]() mutable {
         int success = 0;
 
@@ -309,7 +470,6 @@ void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat forma
         }
         }).detach();
 }
-
 int64_t Hooked_RenderUI(int64_t gMenuManager) {
     if (g_captureNextFrameWithoutUI) {
         if (g_captureDelayFrames > 0) g_captureDelayFrames--;
@@ -488,17 +648,21 @@ void SetupInputHook() {
     auto taskInterface = SKSE::GetTaskInterface();
     if (taskInterface) {
         taskInterface->AddTask([]() {
+			logger::info("Setting up input hook...");
             INITCOMMONCONTROLSEX icex; icex.dwSize = sizeof(INITCOMMONCONTROLSEX); icex.dwICC = ICC_WIN95_CLASSES;
             InitCommonControlsEx(&icex);
             auto renderer = RE::BSGraphics::Renderer::GetSingleton();
             if (renderer) g_hWindow = (HWND)renderer->GetRuntimeData().renderWindows[0].hWnd;
+			logger::info("Initial window handle: {}", fmt::ptr(g_hWindow));
             if (!g_hWindow) g_hWindow = FindWindowA(nullptr, "Skyrim Special Edition");
             if (g_hWindow) {
+				logger::info("Found window handle: {}", fmt::ptr(g_hWindow));
                 DWORD windowPid = 0; GetWindowThreadProcessId(g_hWindow, &windowPid);
                 if (windowPid != GetCurrentProcessId()) return;
                 if (SetWindowSubclass(g_hWindow, MySubclassProc, SCREENSHOT_SUBCLASS_ID, 0)) {
                     SetTimer(g_hWindow, 0x5353, 16, nullptr);
                     UnmapNativeScreenshot(); InstallHooks();
+					logger::info("Input hook installed successfully.");
                 }
             }
             });
