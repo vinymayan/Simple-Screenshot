@@ -136,7 +136,7 @@ namespace ScreenshotMenu {
         doc.AddMember("defaultCustomRatioH", Settings::defaultCustomRatioH, allocator);
         doc.AddMember("imageFormat", static_cast<int>(Settings::imageFormat), allocator);
         doc.AddMember("screenshotPath", rapidjson::StringRef(Settings::screenshotPath.c_str()), allocator);
-
+        doc.AddMember("colorSpaceMode", Settings::colorSpaceMode, allocator);
         FILE* fp = nullptr;
         fopen_s(&fp, SETTINGS_PATH, "wb");
         if (fp) {
@@ -185,6 +185,7 @@ namespace ScreenshotMenu {
                 if (doc.HasMember("defaultCustomRatioH")) Settings::defaultCustomRatioH = doc["defaultCustomRatioH"].GetInt();
                 if (doc.HasMember("imageFormat")) Settings::imageFormat = static_cast<ScreenshotFormat>(doc["imageFormat"].GetInt());
                 if (doc.HasMember("screenshotPath")) Settings::screenshotPath = doc["screenshotPath"].GetString();
+                if (doc.HasMember("colorSpaceMode")) Settings::colorSpaceMode = doc["colorSpaceMode"].GetInt();
             }
 			logger::info("Settings loaded");
         }
@@ -250,6 +251,13 @@ namespace ScreenshotMenu {
             }
             ImGuiMCP::TextColored(ImGuiMCP::ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Will be centered in Screenshot Mode.");
             ImGuiMCP::Unindent();
+        }
+        ImGuiMCP::Separator();
+        ImGuiMCP::Text("Color Space / HDR Handling:");
+
+        const char* colorSpaceOptions[] = { "Auto (May not work)", "Force HDR", "Force SDR" };
+        if (ImGuiMCP::Combo("HDR Mode", &Settings::colorSpaceMode, colorSpaceOptions, 3)) {
+            changed = true;
         }
 
         ImGuiMCP::Spacing();

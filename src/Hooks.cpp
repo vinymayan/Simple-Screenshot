@@ -9,7 +9,6 @@ struct ProcessInputQueueHook {
     }
     static inline REL::Relocation<decltype(thunk)> originalFunction;
     static void install() {
-        SKSE::AllocTrampoline(14);
         auto& trampoline = SKSE::GetTrampoline();
         originalFunction = trampoline.write_call<5>(REL::RelocationID(67315, 68617, 67315).address() + REL::Relocate(0x7B, 0x7B, 0x81), thunk);
     }

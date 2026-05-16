@@ -11,6 +11,7 @@ enum class ScreenshotFormat : int {
 };
 
 namespace Settings {
+    inline int colorSpaceMode = 0; // 0 = Automático, 1 = HDR, 2 = SDR
     // 1. Abrir Menu (Antigo Screenshot)
     inline uint32_t openModeKey_k = 183; // Default PrintScreen
     inline uint32_t openModeKey_m = 0;

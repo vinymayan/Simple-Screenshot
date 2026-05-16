@@ -1,15 +1,16 @@
-#include "logger.h"
+﻿#include "logger.h"
 #include "Events.h"
 #include "Prisma.h"
 #include "Hooks.h"
 
 void OnMessage(SKSE::MessagingInterface::Message* message) {
     if (message->type == SKSE::MessagingInterface::kDataLoaded) {
-        SetupInputHook();
+        SKSE::AllocTrampoline(28);
         ScreenshotMenu::LoadSettings(); // Carrega config salva
         ScreenshotMenu::Register();     // Registra o menu
         Hooks::Install();
         Prisma::Install();
+        SetupInputHook();
     }
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
         // Post-load

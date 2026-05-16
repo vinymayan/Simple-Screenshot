@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <vector>
 #include <ctime>
@@ -33,6 +34,19 @@ int g_captureDelayFrames = 0;
 static bool g_captureNextFrameWithUI = false;
 static bool g_captureNextFrameWithoutUI = false;
 static ScreenshotFormat g_pendingFormat;
+
+static DXGI_COLOR_SPACE_TYPE g_currentColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709; // Assumimos SDR padrão
+static bool g_colorSpaceHooked = false;
+
+typedef HRESULT(WINAPI* SetColorSpace1_t)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
+SetColorSpace1_t OriginalSetColorSpace1 = nullptr;
+
+// Hook no DXGI: Toda vez que o Community Shaders ativar/desativar o HDR, nós interceptamos e salvamos
+HRESULT WINAPI Hooked_SetColorSpace1(IDXGISwapChain3* pSwapChain, DXGI_COLOR_SPACE_TYPE ColorSpace) {
+    g_currentColorSpace = ColorSpace;
+    logger::info("[DXGI] SetColorSpace1 interceptado! Novo Color Space: {}", (uint32_t)ColorSpace);
+    return OriginalSetColorSpace1(pSwapChain, ColorSpace);
+}
 
 typedef HRESULT(WINAPI* Present_t)(IDXGISwapChain*, UINT, UINT);
 Present_t OriginalPresent = nullptr;
@@ -206,22 +220,18 @@ inline void ConvertBT2020TosRGB(float& r, float& g, float& b) {
 
 // Converte Cor Linear HDR para SDR usando curva ACES e Gamma sRGB
 inline float ProcessHDRtoSDR(float linearColor) {
-    // Para evitar estourar com valores extremos do HDR
+    // Para evitar valores negativos
     linearColor = std::max(0.0f, linearColor);
 
-    // ACES Film Tonemapping (Mantém os brilhos altos e o contraste vívido do HDR)
-    float a = 2.51f;
-    float b = 0.03f;
-    float c = 2.43f;
-    float d = 0.59f;
-    float e = 0.14f;
-    float mapped = (linearColor * (a * linearColor + b)) / (linearColor * (c * linearColor + d) + e);
+    // Como o jogo (via ISHDR.hlsl) já aplica um tonemapping fílmico excelente,
+    // aplicar ACES de novo aqui causa "double tonemapping" e o Hue Shift avermelhado.
+    // Basta dar um clamp no paper white (1.0f) para evitar estouro no SDR.
+    float mapped = std::min(linearColor, 1.0f);
 
     // Gamma Correction (Aproximação sRGB padrão de 2.2)
     mapped = pow(mapped, 1.0f / 2.2f);
 
-    // Clamp final de segurança
-    return mapped > 1.0f ? 1.0f : (mapped < 0.0f ? 0.0f : mapped);
+    return mapped;
 }
 
 // Converte Half-Float (16-bits) para Float padrão (32-bits)
@@ -261,7 +271,7 @@ inline int GetBytesPerPixel(DXGI_FORMAT format) {
 }
 
 // Lê os canais RGBA corretamente para os formatos modernos e vanilla do Skyrim
-inline void ReadPixel(uint8_t* rowData, int x, DXGI_FORMAT format, int bpp, float& r, float& g, float& b, float& a) {
+inline void ReadPixel(uint8_t* rowData, int x, DXGI_FORMAT format, int bpp, float& r, float& g, float& b, float& a, bool isHDR10 = false) {
     if (bpp == 8 && format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         uint16_t* p16 = (uint16_t*)(rowData + x * 8);
         r = ConvertHalfToFloat(p16[0]);
@@ -269,226 +279,365 @@ inline void ReadPixel(uint8_t* rowData, int x, DXGI_FORMAT format, int bpp, floa
         b = ConvertHalfToFloat(p16[2]);
         a = ConvertHalfToFloat(p16[3]);
 
-        // Formatos de 16-bits costumam ser lineares (ex: ENB scRGB)
         r = ProcessHDRtoSDR(r) * 255.0f;
         g = ProcessHDRtoSDR(g) * 255.0f;
         b = ProcessHDRtoSDR(b) * 255.0f;
         a = (a > 1.0f ? 1.0f : (a < 0.0f ? 0.0f : a)) * 255.0f;
     }
     else if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-        // Formato 10-bits usado pelo mod HDR10 - Contém curva PQ e cores BT.2020
         uint32_t p32 = *(uint32_t*)(rowData + x * 4);
         r = (p32 & 0x3FF) / 1023.0f;
         g = ((p32 >> 10) & 0x3FF) / 1023.0f;
         b = ((p32 >> 20) & 0x3FF) / 1023.0f;
         a = ((p32 >> 30) & 0x3) / 3.0f;
 
-        // 1. Decodifica de PQ para Luminosidade Real (Nits)
-        r = DecodePQ(r);
-        g = DecodePQ(g);
-        b = DecodePQ(b);
+        if (isHDR10) {
+            // Se HDR estiver ligado: Decodifica PQ, Converte BT.2020 e Tonemap
+            r = DecodePQ(r);
+            g = DecodePQ(g);
+            b = DecodePQ(b);
 
-        // 2. Converte as cores para o padrão da internet (sRGB)
-        ConvertBT2020TosRGB(r, g, b);
+            ConvertBT2020TosRGB(r, g, b);
 
-        // 3. Normaliza usando o "Paper White" padrão (203 Nits = 1.0)
-        r /= 203.0f;
-        g /= 203.0f;
-        b /= 203.0f;
+            r /= 203.0f;
+            g /= 203.0f;
+            b /= 203.0f;
 
-        // 4. Agora sim o Tonemapping ACES fará o trabalho perfeito
-        r = ProcessHDRtoSDR(r) * 255.0f;
-        g = ProcessHDRtoSDR(g) * 255.0f;
-        b = ProcessHDRtoSDR(b) * 255.0f;
+            r = ProcessHDRtoSDR(r) * 255.0f;
+            g = ProcessHDRtoSDR(g) * 255.0f;
+            b = ProcessHDRtoSDR(b) * 255.0f;
+        }
+        else {
+            // Se HDR estiver desligado: Apenas escala as cores normais (SDR 10-bits) para 255
+            r *= 255.0f;
+            g *= 255.0f;
+            b *= 255.0f;
+        }
+
         a = a * 255.0f;
     }
     else {
         uint8_t* p8 = rowData + x * 4;
         if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-            r = p8[2]; g = p8[1]; b = p8[0]; a = p8[3]; // Inverte BGRA para RGBA
+            r = p8[2]; g = p8[1]; b = p8[0]; a = p8[3];
         }
         else {
             r = p8[0]; g = p8[1]; b = p8[2]; a = p8[3];
         }
-        // Se cair aqui, é SDR padrão. Não precisa de Tonemap.
     }
 }
-void CaptureFrameFromSwapChain(IDXGISwapChain* swapChain, ScreenshotFormat format, bool withoutUI) {
+
+
+std::string GetDXGIFormatName(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+    default: return "OUTRO_FORMATO_(" + std::to_string(format) + ")";
+    }
+}
+
+bool IsHDRActive(IDXGISwapChain* swapChain) {
+    if (Settings::colorSpaceMode == 1) return true;
+    if (Settings::colorSpaceMode == 2) return false;
+
+    // Se o nosso hook detectou o CS alterando o Color Space (Dinâmico)
+    if (g_colorSpaceHooked) {
+        return (g_currentColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+            g_currentColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+    }
+
+    // Fallback: Se não hookamos a tempo da inicialização do CS, checamos o monitor físico do Windows
+    if (!swapChain) return false;
+    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+    if (SUCCEEDED(swapChain->GetContainingOutput(&output))) {
+        Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+        if (SUCCEEDED(output.As(&output6))) {
+            DXGI_OUTPUT_DESC1 desc1;
+            if (SUCCEEDED(output6->GetDesc1(&desc1))) {
+                if (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                    desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) {
+                    return true; // Monitor em HDR, assumimos CS em HDR
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void CaptureFrameFromSwapChain(ID3D11Texture2D* sourceTex, ScreenshotFormat format, bool withoutUI, const char* callerContext) {
     std::shared_ptr<void> unlocker(nullptr, [](void*) { g_isCapturing = false; });
-    if (!swapChain) return;
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device11;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context11;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer11;
-    bool captured = false;
-    bool isDX12Interop = false;
-    Microsoft::WRL::ComPtr<ID3D12Device> device12;
+    logger::info("==================================================");
+    logger::info("[CAPTURE] Iniciando captura disparada por: {}", callerContext);
 
-    if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D12Device), (void**)device12.GetAddressOf()))) {
-        isDX12Interop = true;
-        if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer11.GetAddressOf())) && backBuffer11) {
-            backBuffer11->GetDevice(device11.GetAddressOf());
-            if (device11) { device11->GetImmediateContext(context11.GetAddressOf()); if (context11) captured = true; }
-        }
+    if (!sourceTex) {
+        logger::error("[CAPTURE] ERRO: sourceTex eh nulo!");
+        return;
     }
-    if (!captured) {
-        if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer11.GetAddressOf())) && backBuffer11) {
-            backBuffer11->GetDevice(device11.GetAddressOf());
-            if (device11) { device11->GetImmediateContext(context11.GetAddressOf()); if (context11) captured = true; }
-        }
-    }
-    if (!captured || !backBuffer11 || !context11 || !device11) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    sourceTex->GetDesc(&desc);
 
     auto renderer = RE::BSGraphics::Renderer::GetSingleton();
-    Microsoft::WRL::ComPtr<ID3D11Resource> uiResource;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> uiTexture11;
-    bool hasUI = false;
+    IDXGISwapChain* pSwapChain = renderer ? reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain) : nullptr;
 
-    if (renderer && !withoutUI && isDX12Interop) {
-        auto uiRTV = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER].RTV;
-        if (uiRTV) {
-            uiRTV->GetResource(uiResource.GetAddressOf());
-            if (SUCCEEDED(uiResource.As(&uiTexture11))) hasUI = true;
-        }
+    bool isHDRSpace = IsHDRActive(pSwapChain);
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device11;
+    sourceTex->GetDevice(device11.GetAddressOf());
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context11;
+    if (device11) device11->GetImmediateContext(context11.GetAddressOf());
+
+    if (!device11 || !context11) {
+        logger::error("[CAPTURE] ERRO: Falha ao obter device ou context do DirectX.");
+        return;
     }
 
-    D3D11_TEXTURE2D_DESC desc{}; backBuffer11->GetDesc(&desc);
     D3D11_TEXTURE2D_DESC stagingDesc = desc;
-    stagingDesc.BindFlags = 0; stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    stagingDesc.Usage = D3D11_USAGE_STAGING; stagingDesc.MiscFlags = 0;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.MiscFlags = 0;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTex;
     if (FAILED(device11->CreateTexture2D(&stagingDesc, nullptr, stagingTex.GetAddressOf()))) return;
-    context11->CopyResource(stagingTex.Get(), backBuffer11.Get());
+
+    context11->CopyResource(stagingTex.Get(), sourceTex);
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (FAILED(context11->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingUITex;
-    D3D11_MAPPED_SUBRESOURCE mappedUI = { 0 };
-    D3D11_TEXTURE2D_DESC uiDesc{};
+    // 1. Cópia EXTREMAMENTE RÁPIDA (Memcpy) para a memória RAM. Libera o jogo imediatamente!
+    size_t dataSize = mapped.RowPitch * desc.Height;
+    std::vector<uint8_t> rawBuffer(dataSize);
+    memcpy(rawBuffer.data(), mapped.pData, dataSize);
 
-    if (hasUI) {
-        uiTexture11->GetDesc(&uiDesc);
-        // Previne crash com DLSS/FSR onde a UI tem resolução nativa, mas o jogo tem resolução menor.
-        if (uiDesc.Width != desc.Width || uiDesc.Height != desc.Height) {
-            hasUI = false;
-        }
-        else {
-            D3D11_TEXTURE2D_DESC stagingUIDesc = uiDesc;
-            stagingUIDesc.BindFlags = 0; stagingUIDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            stagingUIDesc.Usage = D3D11_USAGE_STAGING; stagingUIDesc.MiscFlags = 0;
-            if (SUCCEEDED(device11->CreateTexture2D(&stagingUIDesc, nullptr, stagingUITex.GetAddressOf()))) {
-                context11->CopyResource(stagingUITex.Get(), uiTexture11.Get());
-                if (FAILED(context11->Map(stagingUITex.Get(), 0, D3D11_MAP_READ, 0, &mappedUI))) hasUI = false;
+    context11->Unmap(stagingTex.Get(), 0);
+
+    // 2. Salva o estado atual do crop para enviar para a thread separada
+    CropData currentCrop = g_crop;
+    g_crop.active = false; // Reseta globalmente para a próxima captura não bugar
+
+    logger::info("[CAPTURE] Frame mapeado e copiado com sucesso. Despachando para processamento assincrono...");
+
+    // 3. Processamento pesado (Matemática HDR, Lasso e HD) transferido 100% para a thread separada!
+    std::thread([format, desc, withoutUI, isHDRSpace, rowPitch = mapped.RowPitch,
+        rawBuffer = std::move(rawBuffer), currentCrop, unlocker]() mutable {
+
+            int windowWidth = desc.Width; int windowHeight = desc.Height;
+            int targetWidth = windowWidth; int targetHeight = windowHeight;
+            int startX = 0; int startY = 0;
+
+            if (currentCrop.active) {
+                startX = currentCrop.x; startY = currentCrop.y;
+                targetWidth = currentCrop.w; targetHeight = currentCrop.h;
+                if (startX < 0) startX = 0; if (startY < 0) startY = 0;
+                if (startX + targetWidth > windowWidth) targetWidth = windowWidth - startX;
+                if (startY + targetHeight > windowHeight) targetHeight = windowHeight - startY;
             }
-            else hasUI = false;
-        }
-    }
 
-    int windowWidth = desc.Width; int windowHeight = desc.Height;
-    int targetWidth = windowWidth; int targetHeight = windowHeight;
-    int startX = 0; int startY = 0;
+            std::vector<uint8_t> pixelData(targetWidth * targetHeight * 4);
+            uint8_t* src = rawBuffer.data();
+            uint8_t* dst = pixelData.data();
 
-    if (g_crop.active) {
-        startX = g_crop.x; startY = g_crop.y; targetWidth = g_crop.w; targetHeight = g_crop.h;
-        if (startX < 0) startX = 0; if (startY < 0) startY = 0;
-        if (startX + targetWidth > windowWidth) targetWidth = windowWidth - startX;
-        if (startY + targetHeight > windowHeight) targetHeight = windowHeight - startY;
-        g_crop.active = false;
-    }
-    else {
-        targetWidth = windowWidth; targetHeight = windowHeight;
-        startX = 0; startY = 0;
-    }
+            bool isBGRA = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+            int gameBpp = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
+            bool useLasso = !currentCrop.lassoPoints.empty();
 
-    std::vector<uint8_t> pixelData(targetWidth * targetHeight * 4);
-    uint8_t* src = (uint8_t*)mapped.pData;
-    uint8_t* dst = pixelData.data();
-    bool useLasso = !g_crop.lassoPoints.empty();
+            for (int y = 0; y < targetHeight; ++y) {
+                uint8_t* rowSrc = src + ((startY + y) * rowPitch) + (startX * gameBpp);
+                uint8_t* rowDst = dst + (y * targetWidth * 4);
 
-    // Calcula os offsets dependendo do formato do Game e da Interface separadamente
-    int gameBpp = GetBytesPerPixel(desc.Format);
-    int uiBpp = hasUI ? GetBytesPerPixel(uiDesc.Format) : 4;
+                for (int x = 0; x < targetWidth; ++x) {
+                    int p = x * 4;
 
-    for (int y = 0; y < targetHeight; ++y) {
-        uint8_t* rowSrc = src + ((startY + y) * mapped.RowPitch) + (startX * gameBpp);
-        uint8_t* rowUI = hasUI ? (uint8_t*)mappedUI.pData + ((startY + y) * mappedUI.RowPitch) + (startX * uiBpp) : nullptr;
+                    // Se usar Lasso, testa a colisão na thread secundária (zero impacto no FPS do jogo)
+                    if (useLasso && !IsPointInPolygon(startX + x, startY + y, currentCrop.lassoPoints)) {
+                        rowDst[p + 0] = 0; rowDst[p + 1] = 0; rowDst[p + 2] = 0; rowDst[p + 3] = 0;
+                        continue;
+                    }
 
-        // DECLARAÇÃO CORRIGIDA: Precisamos calcular onde fica a linha na imagem final (dst)
-        uint8_t* rowDst = dst + (y * targetWidth * 4);
+                    float gameR = 0.0f, gameG = 0.0f, gameB = 0.0f;
 
-        for (int x = 0; x < targetWidth; ++x) {
-            int p = x * 4; // O destino 'dst' SEMPRE será um vetor 4-bytes RGBA8
+                    if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                        uint32_t p32 = *(uint32_t*)(rowSrc + x * 4);
+                        float r = (p32 & 0x3FF) / 1023.0f;
+                        float g = ((p32 >> 10) & 0x3FF) / 1023.0f;
+                        float b = ((p32 >> 20) & 0x3FF) / 1023.0f;
 
-            if (useLasso) {
-                if (!IsPointInPolygon(startX + x, startY + y, g_crop.lassoPoints)) {
-                    rowDst[p + 0] = 0; rowDst[p + 1] = 0; rowDst[p + 2] = 0; rowDst[p + 3] = 0;
-                    continue;
+                        if (withoutUI) {
+                            gameR = ProcessHDRtoSDR(r) * 255.0f;
+                            gameG = ProcessHDRtoSDR(g) * 255.0f;
+                            gameB = ProcessHDRtoSDR(b) * 255.0f;
+                        }
+                        else {
+                            if (isHDRSpace) {
+                                r = DecodePQ(r); g = DecodePQ(g); b = DecodePQ(b);
+                                ConvertBT2020TosRGB(r, g, b);
+                                r /= 203.0f; g /= 203.0f; b /= 203.0f;
+                                gameR = ProcessHDRtoSDR(r) * 255.0f;
+                                gameG = ProcessHDRtoSDR(g) * 255.0f;
+                                gameB = ProcessHDRtoSDR(b) * 255.0f;
+                            }
+                            else {
+                                gameR = r * 255.0f; gameG = g * 255.0f; gameB = b * 255.0f;
+                            }
+                        }
+                    }
+                    else if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        uint16_t* p16 = (uint16_t*)(rowSrc + x * 8);
+                        float r = ConvertHalfToFloat(p16[0]);
+                        float g = ConvertHalfToFloat(p16[1]);
+                        float b = ConvertHalfToFloat(p16[2]);
+
+                        if (withoutUI) {
+                            // Captura pura sem UI: geralmente já é scRGB linear
+                            gameR = ProcessHDRtoSDR(r) * 255.0f;
+                            gameG = ProcessHDRtoSDR(g) * 255.0f;
+                            gameB = ProcessHDRtoSDR(b) * 255.0f;
+                        }
+                        else {
+                            if (isHDRSpace) {
+                                // Faltava fazer o Decode do HDR aqui também!
+                                r = DecodePQ(r); g = DecodePQ(g); b = DecodePQ(b);
+                                ConvertBT2020TosRGB(r, g, b);
+                                r /= 203.0f; g /= 203.0f; b /= 203.0f;
+                                gameR = ProcessHDRtoSDR(r) * 255.0f;
+                                gameG = ProcessHDRtoSDR(g) * 255.0f;
+                                gameB = ProcessHDRtoSDR(b) * 255.0f;
+                            }
+                            else {
+                                gameR = (r > 1.0f ? 1.0f : (r < 0.0f ? 0.0f : r)) * 255.0f;
+                                gameG = (g > 1.0f ? 1.0f : (g < 0.0f ? 0.0f : g)) * 255.0f;
+                                gameB = (b > 1.0f ? 1.0f : (b < 0.0f ? 0.0f : b)) * 255.0f;
+                            }
+                        }
+                    }
+                    else {
+                        if (isBGRA) { gameR = rowSrc[x * 4 + 2]; gameG = rowSrc[x * 4 + 1]; gameB = rowSrc[x * 4 + 0]; }
+                        else { gameR = rowSrc[x * 4 + 0]; gameG = rowSrc[x * 4 + 1]; gameB = rowSrc[x * 4 + 2]; }
+                    }
+
+                    rowDst[p + 0] = (uint8_t)(gameR > 255.0f ? 255.0f : (gameR < 0.0f ? 0.0f : gameR));
+                    rowDst[p + 1] = (uint8_t)(gameG > 255.0f ? 255.0f : (gameG < 0.0f ? 0.0f : gameG));
+                    rowDst[p + 2] = (uint8_t)(gameB > 255.0f ? 255.0f : (gameB < 0.0f ? 0.0f : gameB));
+                    rowDst[p + 3] = 255;
                 }
             }
 
-            float gameR, gameG, gameB, gameA;
-            ReadPixel(rowSrc, x, desc.Format, gameBpp, gameR, gameG, gameB, gameA);
+            std::string path = GetScreenshotPath(format == ScreenshotFormat::PNG ? ".png" : (format == ScreenshotFormat::JPG ? ".jpg" : ".bmp"));
+            int success = 0;
 
-            if (hasUI && rowUI) {
-                float uiR, uiG, uiB, uiA_val;
-                ReadPixel(rowUI, x, uiDesc.Format, uiBpp, uiR, uiG, uiB, uiA_val);
-                float uiA = uiA_val / 255.0f;
+            if (format == ScreenshotFormat::PNG) success = stbi_write_png(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), targetWidth * 4);
+            else if (format == ScreenshotFormat::JPG) success = stbi_write_jpg(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), 90);
+            else success = stbi_write_bmp(path.c_str(), targetWidth, targetHeight, 4, pixelData.data());
 
-                rowDst[p + 0] = (uint8_t)((uiR * uiA) + (gameR * (1.0f - uiA)));
-                rowDst[p + 1] = (uint8_t)((uiG * uiA) + (gameG * (1.0f - uiA)));
-                rowDst[p + 2] = (uint8_t)((uiB * uiA) + (gameB * (1.0f - uiA)));
-                rowDst[p + 3] = 255;
-            }
-            else {
-                rowDst[p + 0] = (uint8_t)gameR;
-                rowDst[p + 1] = (uint8_t)gameG;
-                rowDst[p + 2] = (uint8_t)gameB;
-                rowDst[p + 3] = 255;
-            }
-        }
-    }
+            if (success) { CopyFileToClipboard(path); logger::info("[CAPTURE] SUCESSO: {}", path); }
+            else { logger::error("[CAPTURE] ERRO: Falha ao salvar a imagem."); }
 
-    if (hasUI) context11->Unmap(stagingUITex.Get(), 0);
-    context11->Unmap(stagingTex.Get(), 0);
-
-    std::string path = GetScreenshotPath(format == ScreenshotFormat::PNG ? ".png" : (format == ScreenshotFormat::JPG ? ".jpg" : ".bmp"));
-
-    std::thread([format, path, targetWidth, targetHeight, pixelData = std::move(pixelData), unlocker]() mutable {
-        int success = 0;
-
-        if (format == ScreenshotFormat::PNG)
-            success = stbi_write_png(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), targetWidth * 4);
-        else if (format == ScreenshotFormat::JPG)
-            success = stbi_write_jpg(path.c_str(), targetWidth, targetHeight, 4, pixelData.data(), 90);
-        else
-            success = stbi_write_bmp(path.c_str(), targetWidth, targetHeight, 4, pixelData.data());
-
-        if (success) {
-            CopyFileToClipboard(path);
-        }
         }).detach();
 }
+
 int64_t Hooked_RenderUI(int64_t gMenuManager) {
     if (g_captureNextFrameWithoutUI) {
-        if (g_captureDelayFrames > 0) g_captureDelayFrames--;
-        else {
-            auto renderer = RE::BSGraphics::Renderer::GetSingleton();
-            if (renderer && renderer->GetRuntimeData().renderWindows[0].swapChain) {
-                CaptureFrameFromSwapChain(reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain), g_pendingFormat, true);
+        if (g_captureDelayFrames > 0) {
+            g_captureDelayFrames--;
+            return OriginalRenderUI(gMenuManager);
+        }
+
+        auto renderer = RE::BSGraphics::Renderer::GetSingleton();
+        IDXGISwapChain* swapChain = renderer ? reinterpret_cast<IDXGISwapChain*>(renderer->GetRuntimeData().renderWindows[0].swapChain) : nullptr;
+
+        // Verifica se o HDR do Community Shaders está ativo
+        bool isHDRSpace = IsHDRActive(swapChain);
+
+        if (isHDRSpace) {
+            // ==========================================
+            // MODO HDR (Community Shaders Ativo)
+            // ==========================================
+            // 1. Deixamos a UI renderizar. Isto força o CS a limpar a uiTexture antiga.
+            int64_t result = OriginalRenderUI(gMenuManager);
+
+            // 2. O RTV atual do jogo agora aponta para a uiTexture do CS.
+            // A cena 3D está guardada em segurança. Limpamos a UI com preto transparente!
+            if (renderer) {
+                auto rtv = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER].RTV;
+                if (rtv) {
+                    Microsoft::WRL::ComPtr<ID3D11Device> device;
+                    rtv->GetDevice(&device);
+                    if (device) {
+                        Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+                        device->GetImmediateContext(&context);
+                        float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                        context->ClearRenderTargetView(rtv, clearColor);
+                    }
+                }
             }
+
+            logger::info("[CAPTURE] HDR Ativo: UI apagada da VRAM. Delegando para Hooked_Present...");
+
+            // 3. O SwapChain final terá a cena HDR pura, já codificada. Capturamos no Present!
+            g_captureNextFrameWithUI = true;
             g_captureNextFrameWithoutUI = false;
+
+            return result;
+        }
+        else {
+            // ==========================================
+            // MODO VANILLA (SDR)
+            // ==========================================
+            // A cena 3D pura está no kFRAMEBUFFER agora. Temos de capturar ANTES de renderizar a UI.
+            if (renderer) {
+                ID3D11Texture2D* sceneTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER].texture;
+                if (sceneTex) CaptureFrameFromSwapChain(sceneTex, g_pendingFormat, true, "Hooked_RenderUI (SDR Vanilla)");
+            }
+
+            g_captureNextFrameWithoutUI = false;
+
+            // Depois de capturarmos, deixamos a UI ser renderizada normalmente para o ecrã
+            return OriginalRenderUI(gMenuManager);
         }
     }
+
     return OriginalRenderUI(gMenuManager);
 }
 
 HRESULT WINAPI Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     if (g_captureNextFrameWithUI) {
-        if (g_captureDelayFrames > 0) g_captureDelayFrames--;
+        if (g_captureDelayFrames > 0) {
+            g_captureDelayFrames--;
+        }
         else {
-            CaptureFrameFromSwapChain(pSwapChain, g_pendingFormat, false);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+            bool captured = false;
+
+            // Checa FrameGen (DX12) - Abordagem importada do Screenshot.h
+            Microsoft::WRL::ComPtr<ID3D12Device> device12;
+            if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D12Device), (void**)device12.GetAddressOf()))) {
+                if (SUCCEEDED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer.GetAddressOf())) && backBuffer) {
+                    captured = true;
+                }
+            }
+
+            // Fallback Vanilla (DX11)
+            if (!captured) {
+                if (SUCCEEDED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backBuffer.GetAddressOf())) && backBuffer) {
+                    captured = true;
+                }
+            }
+
+            if (captured && backBuffer) {
+                logger::info("[HOOK] Disparando captura COM UI diretamente do SwapChain Final");
+                CaptureFrameFromSwapChain(backBuffer.Get(), g_pendingFormat, false, "Hooked_Present");
+            }
+            else {
+                logger::error("[HOOK] Falha ao obter o backbuffer no Hooked_Present");
+            }
+
             g_captureNextFrameWithUI = false;
         }
     }
@@ -502,10 +651,24 @@ void InstallHooks() {
     if (swapChain) {
         void** vtable = *(void***)swapChain;
         OriginalPresent = (Present_t)vtable[8];
-        DWORD oldProtect; VirtualProtect(&vtable[8], sizeof(void*), PAGE_READWRITE, &oldProtect);
-        vtable[8] = Hooked_Present; VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &oldProtect);
+        DWORD oldProtect;
+        VirtualProtect(&vtable[8], sizeof(void*), PAGE_READWRITE, &oldProtect);
+        vtable[8] = Hooked_Present;
+        VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &oldProtect);
+
+        // --- HOOK NO IDXGISwapChain3::SetColorSpace1 (Índice 38 na Tabela Virtual) ---
+        // Permite interceptar as mudanças em tempo real feitas pelo Community Shaders
+        Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain3;
+        if (SUCCEEDED(swapChain->QueryInterface(IID_PPV_ARGS(&swapChain3)))) {
+            void** vtable3 = *(void***)swapChain3.Get();
+            OriginalSetColorSpace1 = (SetColorSpace1_t)vtable3[38];
+            VirtualProtect(&vtable3[38], sizeof(void*), PAGE_READWRITE, &oldProtect);
+            vtable3[38] = Hooked_SetColorSpace1;
+            VirtualProtect(&vtable3[38], sizeof(void*), oldProtect, &oldProtect);
+            g_colorSpaceHooked = true;
+            logger::info("[DXGI] Hook em SetColorSpace1 (VTable 38) instalado com sucesso.");
+        }
     }
-    SKSE::AllocTrampoline(14);
     auto& trampoline = SKSE::GetTrampoline();
     OriginalRenderUI = reinterpret_cast<RenderUI_t>(trampoline.write_call<5>(
         REL::RelocationID(35556, 36555).address() + REL::Relocate(0x3ab, 0x371), (uintptr_t)Hooked_RenderUI));
@@ -659,9 +822,14 @@ void SetupInputHook() {
 				logger::info("Found window handle: {}", fmt::ptr(g_hWindow));
                 DWORD windowPid = 0; GetWindowThreadProcessId(g_hWindow, &windowPid);
                 if (windowPid != GetCurrentProcessId()) return;
+				logger::info("Window belongs to current process. Installing subclass...");
                 if (SetWindowSubclass(g_hWindow, MySubclassProc, SCREENSHOT_SUBCLASS_ID, 0)) {
+					logger::info("Subclass installed successfully. Starting async input polling...");
                     SetTimer(g_hWindow, 0x5353, 16, nullptr);
-                    UnmapNativeScreenshot(); InstallHooks();
+                    logger::info("Async input polling started.");
+                    UnmapNativeScreenshot(); 
+					logger::info("Unmap called successfully.");
+                    InstallHooks();
 					logger::info("Input hook installed successfully.");
                 }
             }
